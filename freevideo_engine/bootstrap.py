@@ -1624,6 +1624,23 @@ class Installer:
             '--extra-index-url', os.environ.get('PIP_INDEX_URL') or 'https://pypi.org/simple',
             *reused_torch_companions()])
 
+    def patch_npu_wheels(self, python):
+        """Apply the fixes a wheel needs on Ascend, to the installed copy.
+
+        A wheel cannot carry them: there is no tree to hold the change and a reinstall
+        drops it, which is why these live in npu_patches.py and run here after the
+        packages land. The patches are idempotent and refuse loudly if the code they
+        rewrite has moved, so a version bump fails this step instead of shipping a
+        package that cannot load the encoder.
+        """
+        from .npu_patches import apply as apply_npu_patches
+        changed = apply_npu_patches(python)
+        for name in changed:
+            print('Patched %s for Ascend' % name, flush=True)
+        if not changed:
+            print('Ascend wheel patches already applied', flush=True)
+        return changed
+
     def component_tasks(self, uv):
         """Dependencies, not serial UI stages, determine when work can start."""
         tasks = {}
@@ -1740,6 +1757,8 @@ class Installer:
                  ('environment:' + name,))
             task('npu-companions', lambda executable=python: self.install_npu_companions(executable),
                  ('npu-acceleration',), ('environment:' + name,))
+            task('npu-wheel-patches', lambda executable=python: self.patch_npu_wheels(executable),
+                 ('npu-companions',), ('environment:' + name,))
         # Enqueue downloads as soon as their SDKs exist, before waiting for
         # source setup, encoder checks or acceleration compilation.
         task('models', lambda: self.command('models', [python, '-m', 'freevideo_engine.provision',
