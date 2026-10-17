@@ -18,7 +18,7 @@ from . import execution_paths
 from .bootstrap import inventory, digest, GiB, PACKAGE, DEFAULT_ROOT, existing_parent
 from .geometry import geometry
 from .locking import runtime_lock, LOCK_ENV
-from .monitoring import Monitor, save
+from .monitoring import device_monitor, save
 from .ram import ProcessMemory
 from .terminal_ui import TerminalUI, LogProgress
 from .validation import read_case_reports, validate_metrics, validate_artifacts
@@ -147,7 +147,9 @@ def run_process(command, directory, env, gpu, timeout, minimum_ram, *, sample_gp
     gpu_error = None
     if sample_gpu:
         try:
-            monitor = Monitor(directory / 'gpu.csv', device=gpu).start()
+            monitor = device_monitor(directory / 'gpu.csv', device=gpu)
+            if monitor is None:
+                gpu_error = 'no whole-device sampler is installed (NVML or DCMI)'
         except Exception as error:
             gpu_error = repr(error)
     initial_cgroup, initial_swap = cgroup_snapshot(), swap_snapshot()
@@ -239,7 +241,13 @@ def environment(machine):
     if machine.get('device_backend') == 'mps':
         from .macos_bootstrap import environment as native_environment
         return native_environment(machine['root'], dict(env, OMP_NUM_THREADS='2', MKL_NUM_THREADS='2'))
-    env['CUDA_VISIBLE_DEVICES'] = inherited('CUDA_VISIBLE_DEVICES', machine['gpu_uuid'])
+    if machine.get('device_backend') == 'npu':
+        # Ascend selects its accelerator by index. Its CANN uuid in the CUDA spelling
+        # (what this line did unconditionally) names a device the runtime cannot
+        # resolve, and the installation prepared index 0.
+        env['ASCEND_RT_VISIBLE_DEVICES'] = inherited('ASCEND_RT_VISIBLE_DEVICES', '0')
+    else:
+        env['CUDA_VISIBLE_DEVICES'] = inherited('CUDA_VISIBLE_DEVICES', machine['gpu_uuid'])
     from .triton_compat import environment as compiler_environment
     return compiler_environment(machine['root'], env)
 

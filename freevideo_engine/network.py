@@ -27,7 +27,8 @@ from .system import curl_executable, missing_curl_message, windows
 
 
 SOURCES = {
-    'pypi': {'official': 'https://pypi.org/simple', 'tuna': 'https://pypi.tuna.tsinghua.edu.cn/simple'},
+    'pypi': {'official': 'https://pypi.org/simple', 'tuna': 'https://pypi.tuna.tsinghua.edu.cn/simple',
+             'huaweicloud': 'https://repo.huaweicloud.com/repository/pypi/simple/'},
     'torch': {'official': 'https://download.pytorch.org/whl', 'nju': 'https://mirrors.nju.edu.cn/pytorch/whl'},
     'models': {'official': 'https://huggingface.co', 'hf-mirror': 'https://hf-mirror.com'},
     'vdn-models': {'official': 'https://huggingface.co', 'hf-mirror': 'https://hf-mirror.com',

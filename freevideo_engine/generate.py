@@ -16,7 +16,7 @@ import shutil
 import time
 from contextlib import nullcontext
 
-from .locking import runtime_lock, LOCK_ENV
+from .locking import device_runtime_lock, LOCK_ENV
 from .paths import vdn_root, comfy_root
 from .monitoring import save
 from . import tuning
@@ -54,8 +54,11 @@ def child(command, env, descriptor, log, *, ram_budget_bytes=None, gpu=None, on_
             if on_start:
                 on_start(process.pid)
             if gpu:
-                from .monitoring import Monitor
-                monitor = Monitor(log.with_suffix('.gpu.csv'), device=gpu, pid=process.pid).start()
+                # NVML where there is one, else Ascend's DCMI; None means this
+                # host has no whole-device sampler and the worker's own
+                # accounting stands alone.
+                from .monitoring import device_monitor
+                monitor = device_monitor(log.with_suffix('.gpu.csv'), device=gpu, pid=process.pid)
             while process.poll() is None:
                 if memory:
                     sample = memory.sample(process.pid)
@@ -155,12 +158,17 @@ def low_memory_mode(engine):
 def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environment=None):
     """Plan with idle-cache accounting; reclaim once if it prevents admission."""
     from .hardware import detect
+    from . import npu_hardware
     from .policy import choose, ResourceBudgetError
     from .kernel_capabilities import available_backends
     from .resident_process import credit, release_idle_cache, ENV, SessionRestarted
+    device = getattr(args, 'device', 'cuda')
+    # Ascend facts come from the NPU detector; the CUDA one refuses to report on
+    # a machine without a CUDA GPU.
+    probe = npu_hardware.detect if device == 'npu' else detect
     environment = os.environ if environment is None else environment
     for attempt in range(2):
-        raw = detect()
+        raw = probe()
         encoding_stage = stage == 'before-encoding' and bool(getattr(args, 'prompt_file', None))
         hardware, state = credit(raw, environment, reuse_encoder=encoding_stage)
         row = dict(stage=stage, raw=raw.to_dict(), adjusted=hardware.to_dict(), idle_cache=state)
@@ -179,12 +187,19 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
             planning_canvas = dict(canvas)
             if getattr(args, 'task', None):
                 planning_canvas['task'] = args.task
-            options.update(available_backends=available_backends(hardware, probe_missing=False), canvas=planning_canvas,
+            options.update(available_backends=available_backends(hardware, probe_missing=False,
+                                                                  device=device),
+                canvas=planning_canvas, device=device,
                 demonstrated_ram_bytes=demonstrated_local_ram(hardware, args, canvas))
             cache = getattr(args, 'cache', None)
             if cache is not None and (Path(cache) / 'manifest.json').is_file():
                 manifest = json.loads((Path(cache) / 'manifest.json').read_text(encoding='utf-8'))
-                options['precision'] = 'int8' if manifest.get('precision') == 'int8' else 'fp8'
+                if device == 'npu':
+                    # The NPU backend binds BF16 weights, and its cache holds
+                    # them; a cache without a precision field is BF16.
+                    options['precision'] = manifest.get('precision') or 'bf16'
+                else:
+                    options['precision'] = 'int8' if manifest.get('precision') == 'int8' else 'fp8'
             if getattr(args, '_lora_max_block_bytes', 0):
                 options['lora_max_block_bytes'] = args._lora_max_block_bytes
             if getattr(args, '_lora_root_bytes', 0):
@@ -286,7 +301,8 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
         print(json.dumps(dict(event='release_idle_cache', stage=stage,
             reason='Cached models prevent next-stage loading; releasing them and measuring again',
             resources=row.get('resource_error', row.get('budget_bytes')))), flush=True)
-        lease_scope = runtime_lock() if descriptor is None else nullcontext(descriptor)
+        lease_scope = (device_runtime_lock(hardware.gpu_uuid) if descriptor is None
+                       else nullcontext(descriptor))
         with lease_scope as lease:
             try:
                 row['recovery'] = release_idle_cache(environment, lease)
@@ -341,7 +357,10 @@ def run(args):
 
 def _run(args):
     from .hardware import detect
+    from . import npu_hardware
     from .geometry import geometry
+    _device = getattr(args, 'device', 'cuda')
+    _probe = npu_hardware.detect if _device == 'npu' else detect
     from .continuation import (validate_frames, validate_route, prepare as prepare_continuation,
                                summary as continuation_summary, validate_snapshot, persist_snapshot, restore_snapshot,
                                audio_context, MISSING as CONTINUATION_MISSING)
@@ -459,11 +478,12 @@ def _run(args):
     from .resident_process import credit
     planning = []
     if args.profile:
-        hardware, resident_credit = credit(detect())
+        hardware, resident_credit = credit(_probe())
         profile = json.loads(args.profile.read_text(encoding='utf-8'))
     else:
         hardware, resident_credit, profile = automatic_profile(args, canvas, stage='before-encoding', evidence=planning)
-    print(json.dumps(dict(event='compute_device', backend='CUDA', name=getattr(hardware, 'gpu_name', None),
+    print(json.dumps(dict(event='compute_device', backend=('CANN' if _device == 'npu' else 'CUDA'),
+                          name=getattr(hardware, 'gpu_name', None),
                           uuid=getattr(hardware, 'gpu_uuid', None), vram_total_bytes=getattr(hardware, 'vram_total', None),
                           vram_free_bytes=getattr(hardware, 'vram_free', None))), flush=True)
     allocator_limit_bytes = benchmark_allocator_limit(profile, getattr(args, 'allocator_limit_gib', None), hardware)
@@ -496,21 +516,33 @@ def _run(args):
         planned = continuation_plan(canvas, two_pass, base_steps=base_steps, refine_steps=refine_steps)
         continuation_first = planned['first']
         continuation = usable_continuation(continuation, canvas, None if active_loras else manifest, planned)
-    if manifest.get('precision') not in ('fp8', 'int8', 'bf16'):  # BF16: the unquantized reference
+    if manifest.get('precision', 'bf16') not in ('fp8', 'int8', 'bf16'):  # BF16: the unquantized reference
         raise ValueError('Select the prepared official FP8 or int8 cache')
     destination = args.out.resolve()
     if destination.exists():
-        raise FileExistsError(destination)
+        raise FileExistsError('--out already exists: ' + str(destination)
+                              + '. Choose another name, or remove that file.')
+    # Read the prompt before the one-shot artifacts directory exists. Creating the
+    # directory first meant a mistyped path consumed it, so the corrected retry met a
+    # leftover of the run that never started instead of the work it was asked to do.
+    prompt = args.prompt_file.read_bytes() if args.prompt_file else None
     destination.parent.mkdir(parents=True, exist_ok=True)
     artifacts = destination.with_suffix('.artifacts')
-    artifacts.mkdir(exist_ok=False)
+    if artifacts.is_dir() and not any(artifacts.iterdir()):
+        # Empty: a run failed before writing anything, so remove it rather than make
+        # the retry depend on a manual delete.
+        artifacts.rmdir()
+    if artifacts.exists():
+        raise FileExistsError('A previous run kept its working files in ' + str(artifacts)
+                              + '. Move or remove that directory to reuse this --out.')
+    artifacts.mkdir()
     continuation_directory = artifacts
     if continuation is not None and 'tail' in continuation:
         continuation = freeze_continuation(continuation)
     elif continuation is not None and 'snapshot' not in continuation:
         continuation = persist_snapshot(continuation, artifacts / 'continuation-source.safetensors')
-    if args.prompt_file:
-        shutil.copyfile(args.prompt_file, artifacts / 'prompt.txt')
+    if prompt is not None:
+        (artifacts / 'prompt.txt').write_bytes(prompt)
     repo = Path(__file__).resolve().parents[1]
     report = {'profile': profile, 'seed': args.seed, 'success': False, 'geometry': canvas,
               **({'output_size': output_size} if output_size else {}),
@@ -540,13 +572,21 @@ def _run(args):
         raise KeyboardInterrupt(f'Request interrupted by signal {signum}')
     previous = processes.termination_handler(interrupted)
     try:
-        with runtime_lock() as descriptor:
+        # Shared machine lease plus this accelerator's own exclusive one: two
+        # requests run beside each other on different accelerators, still serialize
+        # on the same one, and setup still excludes both.
+        with device_runtime_lock(hardware.gpu_uuid) as descriptor:
             if active_loras:
                 lora_request = artifacts / 'lora-request.json'
                 lora_result = artifacts / 'lora-result.json'
                 save(lora_request, {'cache': str(args.cache.resolve()), 'adapters': active_loras, 'result': str(lora_result),
                     'mode': 'online' if profile['engine'].get('head_chunk') and profile['engine'].get('inference_kernels') else 'fused'})
-                lora_env = dict(os.environ, PYTHONPATH=str(repo), CUDA_VISIBLE_DEVICES='', PYTHONUNBUFFERED='1')
+                lora_env = dict(os.environ, PYTHONPATH=str(repo), PYTHONUNBUFFERED='1')
+                # The child merges adapters on the host and must not allocate on the
+                # accelerator. Hiding the device is how that is said, and the variable
+                # that says it differs by backend: the CUDA spelling is inert on an
+                # Ascend host, which would leave the NPU visible to the child.
+                lora_env['ASCEND_RT_VISIBLE_DEVICES' if _device == 'npu' else 'CUDA_VISIBLE_DEVICES'] = ''
                 lora_env[LOCK_ENV] = str(descriptor)
                 print(json.dumps({'event': 'lora_prepare_start'}), flush=True)
                 report['lora_resources'] = child([sys.executable, '-m', 'freevideo_engine.lora_cache', '--request', str(lora_request)],
@@ -826,7 +866,8 @@ def _run(args):
                        **({'output_size': output_size} if output_size else {}),
                        'sampling_plan': sampling_plan, 'upscaler_checkpoint': upscaler_checkpoint,
                        'automatic_pass_cache': not bool(args.profile),
-                       'metrics': str(destination.with_suffix('.engine.json'))}
+                       'metrics': str(destination.with_suffix('.engine.json')),
+                       'device': _device}
             if continuation is not None:
                 request['continuation'] = continuation
             if preview:
@@ -837,6 +878,16 @@ def _run(args):
                     'scope': 'PyTorch CUDA allocator only; other CUDA allocations and whole-device usage are measured separately.'}
             request_path = temporary / 'video.json'
             resume_decode = resume_refine = None
+            _resumed = os.environ.get('FREEVIDEO_RESUME_DIR')
+            if _resumed:
+                # Start from a previous attempt's finished sampling instead of
+                # sampling again; the worker revalidates the provenance before it
+                # loads anything. The directory holds latents.pt, metrics.json
+                # and video.json from that attempt.
+                _source = Path(_resumed)
+                resume_decode = dict(latents=str(_source / 'latents.pt'),
+                                     metrics=str(_source / 'metrics.json'),
+                                     request=str(_source / 'video.json'))
             # An upscale reuses its preview's first pass unless a later attempt
             # retains a newer checkpoint, or the current inputs no longer match.
             preview_pass = ({key: refine_source[key] for key in ('input', 'metrics', 'request')}

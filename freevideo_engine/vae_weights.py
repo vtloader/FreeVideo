@@ -1,3 +1,4 @@
+import torch
 """Bounded loading of the H3 video and audio VAEs, one tensor at a time.
 
 Diffusers' from_pretrained first builds a complete CPU state dictionary. With
@@ -13,6 +14,7 @@ optional decoder Linear compute cache: Linear weights are stored as FP16 for
 autocast, while RMSNorm, LayerNorm, residual scales, register tokens and
 post-quantization stay FP32. Original checkpoint bytes are untouched.
 """
+from .torch_device import device_module, device_name
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -196,12 +198,15 @@ def _mapped():
     return not windows()
 
 
-def load_video_decoder(base, *, resident_blocks, weight_source=None, linear_fp16=True, device='cuda'):
+def load_video_decoder(base, *, resident_blocks, weight_source=None, linear_fp16=True, device=None):
     """Place the selected decoder prefix directly on CUDA without a CPU copy.
 
     Later blocks stay on the CPU, or bind to `weight_source` without reading.
     Without the Linear cache every parameter keeps from_pretrained's FP32.
     """
+    # Ascend binds the VAE on npu; the caller may still name a device.
+    if device is None:
+        device = device_name(torch)
     from diffusers import AutoencoderKLMiniMaxH3
     directory = Path(base) / 'vae'
     model = skeleton(AutoencoderKLMiniMaxH3, directory)
@@ -235,12 +240,15 @@ def load_video_decoder(base, *, resident_blocks, weight_source=None, linear_fp16
     return model, metrics
 
 
-def load_video_encoder(base, *, before_upload=None, device='cuda'):
+def load_video_encoder(base, *, before_upload=None, device=None):
     """The conditioning encoder and quant_conv in FP32; decoder tensors are not read.
 
     `before_upload(model)` runs on the meta-parameter model, whose tensor sizes
     are final, before any weight reaches the device.
     """
+    # Ascend binds the VAE on npu; the caller may still name a device.
+    if device is None:
+        device = device_name(torch)
     from diffusers import AutoencoderKLMiniMaxH3
     directory = Path(base) / 'vae'
     model = skeleton(AutoencoderKLMiniMaxH3, directory)
@@ -254,8 +262,11 @@ def load_video_encoder(base, *, before_upload=None, device='cuda'):
     return model, metrics
 
 
-def load_audio_vae(base, *, before_upload=None, device='cuda'):
+def load_audio_vae(base, *, before_upload=None, device=None):
     """The complete audio VAE in FP32, including the buffers stored in its checkpoint."""
+    # Ascend binds the VAE on npu; the caller may still name a device.
+    if device is None:
+        device = device_name(torch)
     from diffusers import AutoencoderKLMiniMaxH3Audio
     directory = Path(base) / 'audio_vae'
     model = skeleton(AutoencoderKLMiniMaxH3Audio, directory)

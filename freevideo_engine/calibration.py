@@ -14,6 +14,7 @@ here; the report is the evidence for deciding.
 Only questions that apply to this machine's own plan run, so a machine whose
 plan has no open question does nothing and says so.
 """
+from .torch_device import device_module, device_name
 import argparse
 import copy
 import hashlib
@@ -27,7 +28,9 @@ import time
 import traceback
 import uuid
 
-from .hardware import detect
+# detect_hardware picks the detector by installation; imported under the name the rest
+# of this file already calls.
+from .cli import detect_hardware as detect
 from .geometry import geometry
 from .kernel_capabilities import available_backends
 from .policy import choose
@@ -166,15 +169,18 @@ def run(cache, conditioning, policy, rows, out, *, seed, repeats, warmup_steps, 
     import torch
     from .runtime import Engine
     from .locking import runtime_lock
-    from .monitoring import Monitor
+    from .monitoring import device_monitor
     report = dict(calibration_id=uuid.uuid4().hex, schema_version=1)
     results = []
-    monitor = Monitor(Path(out) / 'gpu.csv').start()
+    monitor = device_monitor(Path(out) / 'gpu.csv')
+    if monitor is None:
+        raise RuntimeError('Calibration needs a whole-device sampler; '
+                           'this host has neither NVML nor DCMI.')
     try:
         with runtime_lock():
             for attempt, row in enumerate(_sequence(rows, repeats)):
                 engine = None
-                torch.cuda.reset_peak_memory_stats()
+                device_module(torch).reset_peak_memory_stats()
                 monitor.peak = monitor.sample()[0]
                 record = dict(question=row['question'], variant=row['variant'],
                               overrides=row['overrides'], attempt=attempt)
@@ -184,7 +190,7 @@ def run(cache, conditioning, policy, rows, out, *, seed, repeats, warmup_steps, 
                     record['load_seconds'] = round(engine.load_seconds, 3)
                     for _ in range(warmup_steps):
                         engine.sample(conditioning, seed)
-                    torch.cuda.reset_peak_memory_stats()
+                    device_module(torch).reset_peak_memory_stats()
                     video, audio, metrics = engine.sample(conditioning, seed)
                     finite = bool(torch.isfinite(video).all() and torch.isfinite(audio).all())
                     del video, audio
@@ -195,8 +201,8 @@ def run(cache, conditioning, policy, rows, out, *, seed, repeats, warmup_steps, 
                                   steady_seconds_per_step=(round(statistics.median(steps[2:]), 4)
                                                            if len(steps) > 2 else None),
                                   residual_staged_steps=len(metrics.get('residual_offload_steps') or []),
-                                  torch_peak_reserved_bytes=int(torch.cuda.max_memory_reserved()),
-                                  torch_peak_allocated_bytes=int(torch.cuda.max_memory_allocated()),
+                                  torch_peak_reserved_bytes=int(device_module(torch).max_memory_reserved()),
+                                  torch_peak_allocated_bytes=int(device_module(torch).max_memory_allocated()),
                                   whole_gpu_peak_bytes=int(monitor.peak),
                                   host_peak_bytes=host_peak_bytes(),
                                   actual_config={key: dict(engine.config).get(key) for key in row['engine']})

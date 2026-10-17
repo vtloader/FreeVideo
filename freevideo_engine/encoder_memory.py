@@ -1,4 +1,5 @@
 """Bounded encoder OOM recovery without changing tokens or model arithmetic."""
+from .torch_device import device_module, device_name
 import gc
 import os
 import sys
@@ -31,12 +32,12 @@ def snapshot(torch, clip=None, manager=None, *, windows_memory=False):
             row['frames'] = []  # The named counter identifies this optional query.
         result.setdefault('collection_errors', {}).setdefault(section, details)
     try:
-        free, total = torch.cuda.mem_get_info()
+        free, total = device_module(torch).mem_get_info()
         result.update(free_bytes=int(free), total_bytes=int(total))
     except Exception as error:
         failed('cuda_memory', error)
     try:
-        stats = torch.cuda.memory_stats()
+        stats = device_module(torch).memory_stats()
         for target, source in (
                 ('allocated_bytes', 'allocated_bytes.all.current'), ('reserved_bytes', 'reserved_bytes.all.current'),
                 ('peak_allocated_bytes', 'allocated_bytes.all.peak'), ('peak_reserved_bytes', 'reserved_bytes.all.peak'),
@@ -48,11 +49,11 @@ def snapshot(torch, clip=None, manager=None, *, windows_memory=False):
     except Exception as error:
         failed('allocator_stats', error)
     try:
-        result['memory_fraction'] = float(torch.cuda.get_per_process_memory_fraction())
+        result['memory_fraction'] = float(device_module(torch).get_per_process_memory_fraction())
     except Exception as error:
         failed('memory_fraction', error)
     try:
-        stats = torch.cuda.memory.host_memory_stats()
+        stats = device_module(torch).host_memory_stats()
         for target, source in (('host_pinned_allocated_bytes', 'allocated_bytes.current'),
                                ('host_pinned_active_bytes', 'active_bytes.current'),
                                ('host_pinned_peak_bytes', 'allocated_bytes.peak')):
@@ -142,10 +143,10 @@ def release_cast_buffers(manager, torch):
     reset = getattr(manager, 'reset_cast_buffers', None)
     if not callable(reset):
         return None
-    allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    allocated, reserved = device_module(torch).memory_allocated(), device_module(torch).memory_reserved()
     reset()  # The native reset also empties the CUDA cache.
-    return dict(released_allocated_bytes=max(0, allocated - torch.cuda.memory_allocated()),
-                released_reserved_bytes=max(0, reserved - torch.cuda.memory_reserved()))
+    return dict(released_allocated_bytes=max(0, allocated - device_module(torch).memory_allocated()),
+                released_reserved_bytes=max(0, reserved - device_module(torch).memory_reserved()))
 
 
 def encode_with_recovery(clip, tokens, manager, torch, phase, *, max_attempts=3, attempt=None):

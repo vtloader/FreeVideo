@@ -416,11 +416,21 @@ def first_pass_policy(profile, canvas, sampling_plan):
     first['steps'] = sampling_plan['base_steps']
     first['task'] = profile['engine'].get('task', 't2va')
     backend = profile['engine']['attention']
+    # The first pass runs on the family the selected profile was planned for: its
+    # attention backends name it.
+    device = 'npu' if 'npu' in backend.split('/') else 'cuda'
+    if device == 'npu':
+        # Ascend computes in BF16 but reads whichever cache the profile prepared,
+        # which generate.py records under the same key. Without a recorded format
+        # this is a BF16 installation, the answer this pass assumed on its own.
+        precision = profile['engine'].get('precision') or 'bf16'
+    else:
+        precision = 'int8' if profile['engine'].get('linear_compute') == 'int8' else 'fp8'
     selected = choose(hardware, attention=backend, available_backends=set(backend.split('/')),
                       gpu_reserve_gib=gpu_reserve / GiB, ram_reserve_gib=ram_reserve / GiB,
                       lora_max_block_bytes=policy.get('lora_max_block_bytes', 0),
                       lora_root_bytes=policy.get('lora_root_bytes', 0),
-                      precision='int8' if profile['engine'].get('linear_compute') == 'int8' else 'fp8',
+                      precision=precision, device=device,
                       canvas=first, allow_capacity_trial=policy.get('capacity_trial', False)).legacy_profile()
     selected['engine']['steps'] = sampling_plan['base_steps']
     selected['policy']['engine']['steps'] = sampling_plan['base_steps']

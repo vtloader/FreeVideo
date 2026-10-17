@@ -21,10 +21,15 @@ def run(args):
     if destination.exists():
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    hardware = detect()
+    device = getattr(args, 'device', 'cuda')
+    from . import npu_hardware
+    probe = npu_hardware.detect if device == 'npu' else detect
+    hardware = probe()
     policy = choose(hardware, **{key: getattr(args, key) for key in
                     ['vram_gib', 'ram_gib', 'attention', 'gpu_reserve_gib', 'ram_reserve_gib']},
-                    available_backends=available_backends(hardware), allow_capacity_trial=True)
+                    available_backends=available_backends(hardware, device=device),
+                    precision='bf16' if device == 'npu' else 'fp8',
+                    device=device, allow_capacity_trial=True)
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'Encoding interrupted by signal {signum}')
     previous = processes.termination_handler(interrupted)

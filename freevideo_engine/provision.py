@@ -401,8 +401,17 @@ def verify_cache(plan, cache):
     kinds = ('blocks',) if slim else ('blocks', 'adaln')
     expected = {'root'} | {kind + '/' + '%02d' % i for kind in kinds for i in range(count)}
     groups = manifest.get('groups', [])
-    if (manifest.get('precision') not in ('fp8', 'int8') or not manifest.get('linears')
-            or len(groups) != len(expected) or {r.get('group') for r in groups} != expected):
+    acceptable = manifest.get('precision') in ('fp8', 'int8') and bool(manifest.get('linears'))
+    if not acceptable:
+        # The merged BF16 cache is unquantized -- no linears table and no scale format
+        # -- so completeness is the group set alone. It is the prepared cache only
+        # where the device has no FP8 product; elsewhere setup asks for a quantized
+        # one, and this still reads as an incomplete download.
+        from .environments import fp8_linear_available
+        acceptable = (manifest.get('precision', 'bf16') == 'bf16'
+                      and not fp8_linear_available(plan.get('device_backend') or 'cuda'))
+    if (not acceptable or len(groups) != len(expected)
+            or {r.get('group') for r in groups} != expected):
         raise ValueError('Prepared cache is not complete; original model files retained')
     ledger = Path(plan['root']) / 'verified-cache.json'
     stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
@@ -445,9 +454,19 @@ def prepare(plan, out):
         cache = Path(plan['reuse_cache'])
         from .install_tuning import cache_compatible
         manifest = json.loads((cache / 'manifest.json').read_text(encoding='utf-8'))
-        if manifest.get('precision') not in ('fp8', 'int8'):
+        precision = manifest.get('precision', 'bf16')
+        if precision == 'bf16':
+            # The merged BF16 cache carries no scale format, so there is none to
+            # compare. It is the prepared cache only where the device has no FP8
+            # product; elsewhere a quantized cache is still what setup asks for.
+            from .environments import fp8_linear_available
+            if fp8_linear_available(plan.get('device_backend') or 'cuda'):
+                raise ValueError('Reuse cache must contain FP8 or int8 storage.')
+            if not cache_compatible(cache, **cache_format):
+                raise ValueError('Reuse cache is not a complete prepared cache: ' + str(cache))
+        elif precision not in ('fp8', 'int8'):
             raise ValueError('Reuse cache must contain FP8 or int8 storage.')
-        if not cache_compatible(cache, **cache_format):
+        elif not cache_compatible(cache, **cache_format):
             raise ValueError('FP8 scale format differs from this GPU. Omit --cache to prepare the correct one.')
     else:
         if plan.get('device_backend') == 'mps':

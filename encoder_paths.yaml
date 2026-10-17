@@ -1,0 +1,8 @@
+# ComfyUI extra model paths for this installation.
+#
+# The H3 text encoder lives outside ComfyUI's own models/ tree, so the encoder
+# child resolves it through this file (--model-paths). One entry per folder type
+# that is not inside vendor/ComfyUI/models.
+freevideo:
+    base_path: /workspace/FreeVideo/vendor/models/encoder
+    text_encoders: text_encoders

@@ -1,4 +1,5 @@
 """Windows allocator admission; no Torch import or device probing at import time."""
+from .torch_device import device_module, device_name
 import math
 import threading
 import time
@@ -14,9 +15,9 @@ def owned_pool_capacity(torch):
     of the resident worker's pool has already been included by the driver.
     Use the same owner/context and bounds as allocator admission instead.
     """
-    total = torch.cuda.get_device_properties(0).total_memory
-    free, _ = torch.cuda.mem_get_info()
-    reserved = torch.cuda.memory_reserved()
+    total = device_module(torch).get_device_properties(0).total_memory
+    free, _ = device_module(torch).mem_get_info()
+    reserved = device_module(torch).memory_reserved()
     local, reader = None, None
     try:
         from .windows_gpu_memory import AdapterMemory
@@ -71,7 +72,7 @@ def configure(torch, budget_bytes, explicit_limit=None, *, reserve_bytes=0, syst
     """
     global _trial_allocator_owner
     from .policy import memory_fraction
-    total = torch.cuda.get_device_properties(0).total_memory
+    total = device_module(torch).get_device_properties(0).total_memory
     planned = memory_fraction(budget_bytes, total)
     if explicit_limit is not None and (type(explicit_limit) is not int or not 0 < explicit_limit <= total):
         raise ValueError('Benchmark allocator limit must be positive and no larger than physical VRAM')
@@ -86,8 +87,8 @@ def configure(torch, budget_bytes, explicit_limit=None, *, reserve_bytes=0, syst
     if desktop:
         # Initialize CUDA before asking the driver for a context-matched LUID.
         torch.cuda.init()
-        free, _ = torch.cuda.mem_get_info()
-        reserved = torch.cuda.memory_reserved()
+        free, _ = device_module(torch).mem_get_info()
+        reserved = device_module(torch).memory_reserved()
         reader, local = None, None
         try:
             from .windows_gpu_memory import AdapterMemory
@@ -106,15 +107,15 @@ def configure(torch, budget_bytes, explicit_limit=None, *, reserve_bytes=0, syst
                 except Exception as error:
                     report['windows_memory_cleanup_error'] = str(error)
     elif capacity_trial:
-        free, _ = torch.cuda.mem_get_info()
-        reserved = torch.cuda.memory_reserved()
+        free, _ = device_module(torch).mem_get_info()
+        reserved = device_module(torch).memory_reserved()
         local = None
     if desktop or capacity_trial:
         decision = allocator_ceiling(budget_bytes, total, free, reserved, reserve_bytes, local)
         report['admission'] = decision
         limit = min(decision['allocator_limit_bytes'], limit if limit is not None else total)
         if limit <= 0:
-            raise torch.cuda.OutOfMemoryError('CUDA out of memory: no local GPU allocator capacity remains after live budgets')
+            raise torch.OutOfMemoryError('CUDA out of memory: no local GPU allocator capacity remains after live budgets')
         report.update(enforced=True, windows_allocator_limit_enforced=desktop,
                       capacity_trial_limit_enforced=bool(capacity_trial),
                       reason='Keep the CUDA allocator within the live local-memory budget; '
@@ -122,15 +123,15 @@ def configure(torch, budget_bytes, explicit_limit=None, *, reserve_bytes=0, syst
         # A resident process may already have a larger *unused* pool. A new
         # fraction affects future allocation, so release that pool once now.
         if reserved > limit:
-            torch.cuda.empty_cache()
+            device_module(torch).empty_cache()
             report['released_cached_pool_before_request'] = True
     if limit is not None:
-        torch.cuda.set_per_process_memory_fraction(limit / total)
+        device_module(torch).set_per_process_memory_fraction(limit / total)
         _trial_allocator_owner = torch if capacity_trial and not desktop else None
     elif _trial_allocator_owner is torch:
         # A later Linux request can regain ordinary capacity in the same
         # resident worker. Do not leave yesterday's temporary trial cap active.
-        torch.cuda.set_per_process_memory_fraction(1.)
+        device_module(torch).set_per_process_memory_fraction(1.)
         _trial_allocator_owner = None
         report['released_capacity_trial_limit'] = True
     report['effective_allocator_limit_bytes'] = limit
@@ -221,7 +222,7 @@ class LiveGPUBudget:
         try:
             if device_factory is None and windows():
                 from .monitoring import DeviceMemory
-                uuid = str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), 'uuid', ''))
+                uuid = str(getattr(device_module(torch).get_device_properties(device_module(torch).current_device()), 'uuid', ''))
                 if uuid and not uuid.startswith(('GPU-', 'MIG-')):
                     uuid = 'GPU-' + uuid
                 device_factory = lambda: DeviceMemory(uuid or None)

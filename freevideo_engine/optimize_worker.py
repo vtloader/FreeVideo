@@ -1,4 +1,5 @@
 """Small measured trials; reuse compute state, reload only for placement changes."""
+from .torch_device import device_module, device_name
 import argparse
 import copy
 from contextlib import contextmanager
@@ -16,7 +17,7 @@ import torch
 
 from .decode import decode_to_file
 from .locking import runtime_lock
-from .monitoring import save, Monitor
+from .monitoring import device_monitor, save
 from .ram import ProcessMemory
 from .runtime import Engine
 from .tuning import PATCH_KEYS, PLACEMENT_KEYS
@@ -64,7 +65,10 @@ def measured_probe(engine, request, label):
     """Whole-device VRAM plus the worker's physical/commit RAM during a probe."""
     folder = Path(request['out']) / 'probes'
     folder.mkdir(exist_ok=True)
-    gpu = Monitor(folder / (label + '.csv')).start()
+    gpu = device_monitor(folder / (label + '.csv'))
+    if gpu is None:
+        raise RuntimeError('Optimization probes need a whole-device sampler; '
+                           'this host has neither NVML nor DCMI.')
     ram, stop, errors = ProcessMemory(), threading.Event(), []
     def sample_ram():
         while not stop.is_set():
@@ -104,10 +108,10 @@ def probe(engine, conditioning, seed, canvas, *, fingerprint=False):
     def before(module, arguments):
         if times:
             raise Finished()
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         started.append(time.perf_counter())
     def after(module, arguments, output):
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         times.append(time.perf_counter() - started[-1])
         values = (output.sample, output.audio_sample) if hasattr(output, 'sample') else output
         if not all(bool(torch.isfinite(value).all()) for value in values):
@@ -136,7 +140,7 @@ def probe(engine, conditioning, seed, canvas, *, fingerprint=False):
         raise
     finally:
         cleanup_errors = []
-        for operation in [handle.remove for handle in handles] + [gc.collect, torch.cuda.empty_cache]:
+        for operation in [handle.remove for handle in handles] + [gc.collect, device_module(torch).empty_cache]:
             try:
                 operation()
             except BaseException as error:
@@ -226,7 +230,7 @@ def run(request):
                 # certify headroom for a combined, unmeasured configuration.
                 memory_row = request.get('complete_baseline', observed) if not combined else observed
                 planned = candidate_plan(memory_row, current, maximum=20,
-                    live_gpu_free=torch.cuda.mem_get_info()[0], live_ram_available=available,
+                    live_gpu_free=device_module(torch).mem_get_info()[0], live_ram_available=available,
                     live_ram_sample=memory)
                 result.setdefault('candidate_plans', []).append(planned)
                 choices = [item['patch'] for item in planned['candidates']]
@@ -256,7 +260,7 @@ def run(request):
                                          'gpu': measured['gpu'], 'ram': measured['ram']})
                 if equal and seconds < observed['engine']['sample_seconds']:
                     combined, observed = patch, measured
-            except (torch.cuda.OutOfMemoryError, MemoryError) as error:
+            except (torch.OutOfMemoryError, MemoryError) as error:
                 result['trials'].append({'patch': patch, 'status': 'memory-rejected', 'error': str(error)})
                 # End this CUDA worker after exhaustion. Normal generation
                 # retries placement in fresh workers; a probe failure cannot

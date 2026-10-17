@@ -1,4 +1,5 @@
 """Contiguous D2H head groups with double-buffered CPU projection tiles."""
+from .torch_device import device_module, device_name
 import torch
 
 
@@ -22,7 +23,7 @@ class HeadReadouts:
 
     def project(self, module, output, rows):
         # The caller synchronizes once after all D2H groups have been written.
-        stream = torch.cuda.current_stream(output.device)
+        stream = device_module(torch).current_stream(output.device)
         for index, start in enumerate(range(0, rows, self.tile_rows)):
             slot = index % 2
             if self.events[slot] is not None:
@@ -34,7 +35,7 @@ class HeadReadouts:
                 tile[:, offset:offset + width].copy_(group[start:start + count])
                 offset += width
             device_values = tile.to(output.device, non_blocking=True)
-            done = torch.cuda.Event()
+            done = device_module(torch).Event()
             done.record(stream)
             self.events[slot] = done
             yield slice(start, start + count), module(device_values)

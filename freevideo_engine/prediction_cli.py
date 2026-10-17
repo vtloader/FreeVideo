@@ -13,7 +13,9 @@ import sys
 
 from .adaptive import attempt_geometry, benchmark_allocator_limit, history_path, local_identity
 from .geometry import geometry
-from .hardware import detect
+# detect_hardware picks the detector by installation; imported under the name the rest
+# of this file already calls.
+from .cli import detect_hardware as detect
 from .kernel_capabilities import available_backends
 from .paths import data_root
 from .policy import choose

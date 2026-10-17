@@ -4,6 +4,7 @@ The optimization is inspired by NVIDIA's Sol-H3 AdaLN precompute: timesteps are
 known before sampling, so retain the small modulation outputs instead of 26 GB
 of immutable projection weights. FL2VA has a separate keyframe timestep schedule.
 """
+from .torch_device import device_module, device_name
 import hashlib
 import json
 from pathlib import Path
@@ -210,7 +211,7 @@ class TableCache:
         if not provenance.exists():
             from diffusers.models.transformers import transformer_minimax_h3
             producer = {'torch': str(torch.__version__), 'cuda': torch.version.cuda,
-                'gpu': torch.cuda.get_device_name() if str(self.device).startswith('cuda') else 'cpu',
+                'gpu': device_module(torch).get_device_name() if str(self.device).startswith('cuda') else 'cpu',
                 'implementation': assets.file_hash(__file__),
                 'original_implementation': assets.file_hash(transformer_minimax_h3.__file__),
                 'matmul_precision': torch.get_float32_matmul_precision(),

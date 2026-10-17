@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Measure an isolated GPU experiment natively or with optional enforced limits."""
+from .torch_device import device_module, device_name
 import argparse
 import csv
 import datetime
@@ -62,7 +63,7 @@ def mps_client_device(pipe, log, device):
     throwaway client which device it received and compare.
     """
     code = ('import torch;'
-            'p = torch.cuda.get_device_properties(torch.cuda.current_device());'
+            'p = device_module(torch).get_device_properties(torch.cuda.current_device());'
             'u = str(getattr(p, "uuid", ""));'
             'print(u if u.startswith(("GPU-", "MIG-")) else "GPU-" + u)')
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(device),

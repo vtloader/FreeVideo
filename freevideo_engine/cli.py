@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from .hardware import Hardware, detect
 from .kernel_capabilities import available_backends
-from .policy import choose
+from .policy import choose, npu_capacity
 
 
 def write_json(value, path=None):
@@ -17,13 +17,49 @@ def write_json(value, path=None):
     print(text, end='')
 
 
+def installed_device():
+    """The accelerator this installation was set up for.
+
+    ``machine.json`` records it. ``--device`` used to default to the string 'cuda'
+    outright, so a process handed no ``--device`` of its own -- the launcher's
+    generate child -- sent an Ascend installation to the CUDA detector, which
+    refuses to report on a host without a CUDA GPU. A host with no record keeps the
+    previous answer, so nothing changes where setup never ran.
+    """
+    try:
+        from .paths import data_root
+        value = json.loads((data_root() / 'machine.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError, KeyError):
+        return 'cuda'
+    backend = (value or {}).get('device_backend')
+    return backend if backend in ('cuda', 'npu') else 'cuda'
+
+
+def detect_hardware(device=None):
+    """The hardware snapshot, read by this installation's accelerator detector.
+
+    ``hardware.detect()`` is the CUDA detector: it measures a CUDA GPU and refuses a
+    host that has none. The planner already chooses between the two detectors by
+    device, but the commands that report, benchmark, calibrate or precompile did not,
+    so an Ascend installation failed there exactly as generation did before
+    ``--device`` reached it. This asks the installation which accelerator it was set
+    up for. Neither detector initialises a device.
+    """
+    device = device or installed_device()
+    if device == 'npu':
+        from .npu_hardware import detect
+    else:
+        from .hardware import detect
+    return detect()
+
+
 def resource_arguments(parser):
     parser.add_argument('--vram-gib', type=float, help='Nominal capacity, bounded by detected VRAM')
     parser.add_argument('--ram-gib', type=float, help='Nominal system RAM, bounded by detected RAM')
     parser.add_argument('--gpu-reserve-gib', type=float,
                         help='Explicit foreground VRAM growth reserve (minimum 0.2 GiB); automatic planning may shrink its default reserve for a tight request')
     parser.add_argument('--ram-reserve-gib', type=float, help='Override headroom kept beyond current system RAM usage')
-    parser.add_argument('--attention', default='auto', help='auto, sage2, cudnn, torch-flash, fa2, fa4, or global/window')
+    parser.add_argument('--attention', default='auto', help='auto, sage2, cudnn, torch-flash, fa2, fa4, npu, or global/window')
 
 
 def main():
@@ -54,6 +90,8 @@ def main():
     resource_arguments(plan)
     plan.add_argument('--hardware-json', type=Path, help='Inspect a fixture, not a hardware benchmark')
     plan.add_argument('--out', type=Path)
+    plan.add_argument('--device', default=installed_device(), choices=('cuda', 'npu'),
+                      help='Plan for the CUDA device, or report Ascend NPU capacity until a BF16 block model exists')
     plan.add_argument('--width', type=int, default=1344)
     plan.add_argument('--height', type=int, default=768)
     plan_length = plan.add_mutually_exclusive_group()
@@ -63,6 +101,8 @@ def main():
     doctor.add_argument('--probe', action='store_true', help='Execute small kernels in isolated processes')
     doctor.add_argument('--require-paths', action='store_true', help='Fail if model or source directories are missing')
     doctor.add_argument('--out', type=Path, help='Save the complete kernel report, including optional failures')
+    doctor.add_argument('--device', default=installed_device(), choices=('cuda', 'npu'),
+                        help='Report the CUDA device, or the Ascend NPU')
     sub.add_parser('diagnose', help='Collect bounded local diagnostics, even after a failed setup')
     sub.add_parser('optimize', help='Reuse a test report and validate bounded local tuning')
     sub.add_parser('resource-history', help='Inspect local performance and resource measurements (CPU only)')
@@ -76,12 +116,19 @@ def main():
     prepare.add_argument('--checkpoint', type=Path, required=True)
     prepare.add_argument('--cache-root', type=Path, required=True)
     prepare.add_argument('--bf16-source', type=Path)
+    prepare.add_argument('--device', choices=('cuda', 'npu'),
+                        help='Accelerator the quantization targets. Detected when omitted: a device '
+                             'without an FP8 product (Ascend) keeps the merged BF16 cache instead.')
     encode = sub.add_parser('encode', help='Save reusable text conditioning for generation and matched benchmarks')
     resource_arguments(encode)
+    encode.add_argument('--device', default=installed_device(), choices=('cuda', 'npu'),
+                        help='Device family the encoding plan targets')
     encode.add_argument('--prompt-file', type=Path, required=True)
     encode.add_argument('--out', type=Path, required=True)
     generate = sub.add_parser('generate', help='Generate an MP4 from text or cached conditioning')
     resource_arguments(generate)
+    generate.add_argument('--device', default=installed_device(), choices=('cuda', 'npu'),
+                          help='Device family the generation plan targets')
     source = generate.add_mutually_exclusive_group(required=True)
     source.add_argument('--prompt-file', type=Path)
     source.add_argument('--conditioning', type=Path)
@@ -154,6 +201,18 @@ def main():
         from .macos_generate import dispatch
         return dispatch(args)
     if args.command == 'plan':
+        if args.device == 'npu':
+            # Ascend placement is not calibrated yet; report the admitted
+            # capacity instead of planning residency from CUDA block
+            # measurements. A full policy needs a BF16 block model first.
+            if args.hardware_json:
+                hardware = Hardware.from_dict(json.loads(args.hardware_json.read_text(encoding='utf-8')))
+            else:
+                from . import npu_hardware
+                hardware = npu_hardware.detect()
+            write_json(npu_capacity(hardware, **{key: getattr(args, key) for key in
+                       ['vram_gib', 'ram_gib', 'gpu_reserve_gib', 'ram_reserve_gib']}), args.out)
+            return
         from .geometry import geometry
         canvas = geometry(args.width, args.height, frames=args.frames, seconds=args.seconds)
         from .two_pass import render_canvas
@@ -166,7 +225,7 @@ def main():
         write_json(policy.to_dict(), args.out)
     elif args.command == 'doctor':
         from .doctor import doctor
-        result = doctor(probe=args.probe)
+        result = doctor(probe=args.probe, device=args.device)
         if args.out:
             from .monitoring import save
             save(args.out, result)
@@ -184,10 +243,18 @@ def main():
     elif args.command == 'prepare':
         from .paths import add_vdn
         add_vdn()
+        from .environments import fp8_linear_available, prepare_device
         from .weights import prepare as prepare_bf16
-        from .fp8 import prepare as prepare_fp8
+        device = prepare_device(getattr(args, 'device', None))
         source = args.bf16_source or prepare_bf16(args.base, args.checkpoint, args.cache_root)
-        write_json({'cache': str(prepare_fp8(source, args.cache_root, base=args.base, checkpoint=args.checkpoint))})
+        if not fp8_linear_available(device):
+            # No FP8 product on this device, so the merged BF16 cache is the prepared
+            # cache: a quantization pass would be decoded straight back to BF16.
+            write_json({'cache': str(source), 'precision': 'bf16', 'device': device,
+                        'note': 'Ascend computes in BF16; the merged cache is the prepared cache here.'})
+        else:
+            from .fp8 import prepare as prepare_fp8
+            write_json({'cache': str(prepare_fp8(source, args.cache_root, base=args.base, checkpoint=args.checkpoint))})
     elif args.command == 'generate':
         from .generate import run
         run(args)

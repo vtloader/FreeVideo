@@ -16,7 +16,10 @@ import traceback
 from .execution_paths import execution_environment
 from .bootstrap import DEFAULT_ROOT
 from .diagnostics import latest
-from .hardware import detect, GiB
+from .hardware import GiB
+# detect_hardware picks the detector by installation; imported under the name the rest
+# of this file already calls.
+from .cli import detect_hardware as detect
 from .kernel_capabilities import available_backends
 from .locking import runtime_lock, LOCK_ENV
 from . import processes

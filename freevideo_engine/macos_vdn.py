@@ -4,6 +4,7 @@ CUDA-only imports, sampler synchronization and dead tensor lifetimes are adapted
 The reference hybrid equations, model topology, schedule and checkpoint names are unchanged.
 Optimized CUDA inference kernels remain unavailable on this reference MPS path.
 """
+from .torch_device import device_module, device_name
 import hashlib
 import importlib
 import json
@@ -38,7 +39,7 @@ EDITS = {
          '            block.forward = types.MethodType(fast_block_forward, block)\n'),
     ),
     'src/inference/render.py': (
-        ('torch.cuda.synchronize(device)', 'torch.mps.synchronize()'),
+        ('device_module(torch).synchronize(device)', 'torch.mps.synchronize()'),
         # RoPE immediately casts coordinates to FP32. Move that exact cast
         # before device transfer because MPS cannot store float64 tensors.
         ('position_ids.to(device), token_tags.to(device)',
@@ -49,7 +50,7 @@ EDITS = {
 
 def adapt(name, content):
     for before, after in EDITS.get(name, ()):
-        count = 3 if before == 'torch.cuda.synchronize(device)' else 1
+        count = 3 if before == 'device_module(torch).synchronize(device)' else 1
         if content.count(before) != count:
             raise ValueError('Pinned VDN Mac patch no longer matches: ' + name)
         content = content.replace(before, after)

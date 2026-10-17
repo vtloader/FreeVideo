@@ -30,7 +30,8 @@ from .install_tuning import build_parallelism, required_models, cache_compatible
 from .terminal_ui import TerminalUI, LogProgress
 from .locking import runtime_lock, LOCK_ENV
 from .environments import (ENVIRONMENTS, environment_names, select_layout, role_pythons, constraints_file,
-                           bootstrap_versions, uv_file_arguments)
+                           bootstrap_versions, uv_file_arguments, setup_device, runtime_requirements,
+                           CUDA_WHEEL_PACKAGES, fp8_linear_available, reused_torch_companions, TORCH_CPU_INDEX)
 from . import disk_space
 from . import network
 from . import processes
@@ -195,17 +196,28 @@ def dependency_status(root, layout='unified', system=None):
                    [s.strip() for s in (SOURCE / 'constraints/encoder-runtime.txt').read_text(encoding='utf-8').splitlines()
                     if s.strip() and not s.startswith('#')]}
     packages['unified'] = sorted(set(packages['engine'] + packages['encoder']))
-    if system == 'Windows':
+    npu = setup_device() == 'npu'
+    if system == 'Windows' and not npu:
         for name in packages:
             packages[name] = ['triton-windows' if p == 'triton' else p for p in packages[name]]
+    if npu:
+        # Torch and Torch-NPU arrive through the interpreter the venv reuses, so
+        # this checks that they are importable and leaves their versions to the
+        # probe receipt. Triton is the Ascend fork, and SageAttention has no
+        # Ascend build, so neither is expected under its CUDA name.
+        for name in packages:
+            packages[name] = sorted({('triton-ascend' if item == 'triton' else item)
+                                     for item in packages[name] if item != 'sageattention'})
     for name in environment_names(layout):
         names = packages[name]
         expected = dict(line.strip().lower().split('==', 1) for line in
                         constraints_file(name, system).read_text(encoding='utf-8').splitlines() if '==' in line)
         expected = {name.replace('_', '-'): version for name, version in expected.items()}
-        expected.update({'freevideo-engine': __version__, 'sageattention': '2.2.0'})
-        if system == 'Windows':
-            expected['sageattention'] = json.loads((PACKAGE / 'bootstrap_versions.json').read_text(encoding='utf-8'))['windows']['sageattention']['version']
+        expected.update({'freevideo-engine': __version__})
+        if not npu:
+            expected['sageattention'] = '2.2.0'
+            if system == 'Windows':
+                expected['sageattention'] = json.loads((PACKAGE / 'bootstrap_versions.json').read_text(encoding='utf-8'))['windows']['sageattention']['version']
         python = venv_python(root / 'envs' / name, system)
         row = {'python': str(python), 'exists': python.exists(), 'installed': {}, 'missing': sorted(set(names)), 'mismatched': {}}
         if python.exists():
@@ -277,7 +289,36 @@ def digest(path, algorithm='sha256', git_blob=False):
     return h.hexdigest()
 
 
+def inventory_npu(gpu=None):
+    """The Ascend counterpart of :func:`inventory`, in the same snapshot shape.
+
+    There is no nvidia-smi to query, so the device facts come from the detector the
+    engine's planner already uses, and ``selected_gpu`` keeps the keys the rest of
+    setup reads. ``driver_version`` carries the Ascend driver, and the CANN version
+    sits beside it because setup reads those two where CUDA reads a driver floor.
+    """
+    from .npu_hardware import detect
+    hardware = detect()
+    selector = gpu if gpu is not None else os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '0').split(',')[0]
+    if str(selector) not in ('0', str(hardware.gpu_uuid), str(hardware.gpu_name)):
+        raise ValueError('Select the Ascend device by its UUID with --gpu.')
+    ram = system_memory()
+    limit, available = cgroup_capacity(include_reclaimable=True)
+    selected = {'index': '0', 'uuid': hardware.gpu_uuid, 'name': hardware.gpu_name, 'compute_cap': None,
+                'driver_version': hardware.driver_version, 'cann_version': hardware.cuda_version,
+                'pci.bus_id': None, 'memory.total': str(hardware.vram_total // 2**20),
+                'memory.free': str(hardware.vram_free // 2**20)}
+    return {'hardware': hardware.to_dict(), 'selected_gpu': selected, 'gpus': [selected],
+            'kernel': platform.release(), 'platform': platform.platform(), 'machine': platform.machine(),
+            'cpu_threads': os.cpu_count(), 'swap_total_bytes': ram.get('swap_total_bytes'),
+            'swap_free_bytes': ram.get('swap_free_bytes'), 'system_memory': ram,
+            'compiler': shutil.which('g++'), 'make': shutil.which('make'),
+            'git': usable_git(), 'git_found': shutil.which('git')}
+
+
 def inventory(gpu=None):
+    if setup_device() == 'npu':
+        return inventory_npu(gpu)
     smi = nvidia_smi()
     query = 'index,uuid,name,compute_cap,memory.total,memory.free,driver_version,pci.bus_id'
     result = subprocess_output.run_external([smi, '--query-gpu=' + query, '--format=csv,noheader,nounits'],
@@ -474,6 +515,12 @@ def plan(args, *, local_progress=None, stage=None):
     saved = json.loads((root / 'machine.json').read_text(encoding='utf-8')) if (root / 'machine.json').is_file() else {}
     storage = getattr(args, 'storage', None) or saved.get('storage', 'compact')
     layout = select_layout(getattr(args, 'environment', None), saved)
+    if setup_device() == 'npu':
+        # Ascend has no CUDA wheel set to split: one interpreter carries the
+        # CANN-matched Torch-NPU and every role shares it.
+        if getattr(args, 'environment', None) not in (None, 'unified'):
+            raise ValueError('An Ascend installation keeps the single unified environment')
+        layout = 'unified'
     # v0.2.0 stored the encoder directory only in its retained setup plan.
     prior_path = Path(saved['setup_run']) / 'plan.json' if saved.get('setup_run') else None
     prior = json.loads(prior_path.read_text(encoding='utf-8')) if prior_path and prior_path.is_file() else {}
@@ -491,22 +538,36 @@ def plan(args, *, local_progress=None, stage=None):
         cache_format = dict(capability=None, scale_granularity='int8_convrot')
         prepared_format = 'int8_convrot'
     else:
-        if not args.hardware_json and (platform.system() not in ('Linux', 'Windows') or platform.machine().lower() not in ('x86_64', 'amd64')):
-            raise RuntimeError('One-click setup supports Linux x86_64 and native Windows x64.')
+        machine = platform.machine().lower()
+        ascend = setup_device() == 'npu' and machine in ('aarch64', 'arm64')
+        if not args.hardware_json and (platform.system() not in ('Linux', 'Windows')
+                                       or (machine not in ('x86_64', 'amd64') and not ascend)):
+            raise RuntimeError('One-click setup supports Linux x86_64 and native Windows x64, '
+                               'or Linux aarch64 with FREEVIDEO_SETUP_DEVICE=npu.')
         snapshot = json.loads(args.hardware_json.read_text(encoding='utf-8')) if args.hardware_json else inventory(args.gpu)
         hardware = Hardware.from_dict(snapshot['hardware'])
         errors = []
-        if snapshot.get('machine', '').lower() not in ('x86_64', 'amd64') or hardware.system not in ('Linux', 'Windows'):
-            errors.append('This installer supports Linux x86_64 and native Windows x64.')
+        ascend = setup_device() == 'npu'
+        if hardware.system not in ('Linux', 'Windows') or (
+                not ascend and snapshot.get('machine', '').lower() not in ('x86_64', 'amd64')):
+            errors.append('This installer supports Linux x86_64 and native Windows x64, '
+                          'or Linux aarch64 with FREEVIDEO_SETUP_DEVICE=npu.')
         windows_target = hardware.system == 'Windows'
         if windows_target and layout != 'unified':
             errors.append('Native Windows uses the unified environment. Rerun with --environment unified.')
             layout = 'unified'
         if windows_target and getattr(args, 'rebuild_sage', False):
             errors.append('Windows uses the Sage2 wheel FreeVideo tests; --rebuild-sage is a Linux source-build option.')
-        if int(snapshot['selected_gpu']['driver_version'].split('.')[0]) < 580:
-            errors.append('NVIDIA driver 580 or newer is required by the CUDA 13 encoder FreeVideo tests; update the driver first.')
-        compatibility = hardware.cuda_compatibility()
+        if ascend:
+            # The NVIDIA driver floor and the compute-capability floor are CUDA
+            # facts. Ascend admission is its own reading, and it is the same one the
+            # planner and doctor use on that device.
+            from .policy import device_admission
+            compatibility = device_admission(hardware, device='npu')
+        else:
+            if int(snapshot['selected_gpu']['driver_version'].split('.')[0]) < 580:
+                errors.append('NVIDIA driver 580 or newer is required by the CUDA 13 encoder FreeVideo tests; update the driver first.')
+            compatibility = hardware.cuda_compatibility()
         if compatibility['error']:
             errors.append(compatibility['error'])
         snapshot['cuda_compatibility'] = compatibility
@@ -545,9 +606,22 @@ def plan(args, *, local_progress=None, stage=None):
                     and install_tuning.discover_prepared(args.reuse_models, hardware.capability) is not None):
                 prepared_format = 'fp8'
         if getattr(args, 'cache', None) and getattr(args, 'prepared_format', 'auto') in (None, 'auto'):
-            # An explicitly named cache keeps its own format.
-            prepared_format = ('int8_convrot' if cache_compatible(args.cache, hardware.capability, scale_granularity='int8_convrot')
-                               else 'fp8')
+            # An explicitly named cache keeps its own format, read from the cache.
+            # Calling every non-int8 cache FP8 would mislabel the merged BF16 one,
+            # which is the cache a device without an FP8 product prepares.
+            from .install_tuning import cache_precision
+            if cache_compatible(args.cache, hardware.capability, scale_granularity='int8_convrot'):
+                prepared_format = 'int8_convrot'
+            elif cache_precision(args.cache) == 'bf16':
+                prepared_format = 'bf16'
+            else:
+                prepared_format = 'fp8'
+        if not fp8_linear_available('npu' if ascend else 'cuda'):
+            # No FP8 product here, so BF16 weights are the storage this device runs.
+            # An explicitly named cache still wins: the caller pointed at bytes that
+            # exist, and the reader decodes whichever storage it holds.
+            if getattr(args, 'cache', None) is None:
+                prepared_format = 'bf16'
         if prepared_format == 'int8_convrot':
             cache_format['scale_granularity'] = 'int8_convrot'
     model_dir = Path(args.models or saved.get('model_root') or root / 'models' / 'vdn').expanduser().resolve()
@@ -569,7 +643,8 @@ def plan(args, *, local_progress=None, stage=None):
     from . import prepared_model
     prepared = None
     model_source = getattr(args, 'model_source', 'prepared')
-    if reuse_cache is None and not getattr(args, 'rebuild_cache', False) and model_source == 'prepared':
+    if (reuse_cache is None and not getattr(args, 'rebuild_cache', False)
+            and model_source == 'prepared' and prepared_format != 'bf16'):
         prepared = prepared_model.select(root=root, **cache_format)
     prepared_dir = prepared['directory'] if prepared else None
     if mac_target and reuse_cache is None and prepared is None:
@@ -766,6 +841,10 @@ def plan(args, *, local_progress=None, stage=None):
             'test_artifacts_estimate_gib': '5–8 GiB for the standard five-case suite; all outputs retained',
             'first_generation_note': 'Portable AdaLN tables follow model weights and the exact schedule, across GPUs and Torch/CUDA versions. New schedules or modulation-changing LoRAs require preparation. Existing environments stay on disk when switching.',
             'estimates_are_not_capacity_guarantees': True, 'errors': errors,
+            # The accelerator family this installation is for. machine.json carries it,
+            # and the engine reads it back to decide what a device supports
+            # (continuation and image generation are CUDA-only paths today).
+            'device_backend': 'npu' if ascend else 'cuda',
             'steps': ['Install isolated uv/Python and ' + ('one shared CUDA environment' if layout == 'unified' else 'two CUDA environments'),
                       'Clone the VDN, patched Diffusers and native H3 text-encoder library versions FreeVideo tests',
                       'Install verified Windows Triton / Sage2 wheels' if windows_target else 'Install a local CUDA compiler and build Sage2 for the detected GPU only',
@@ -774,7 +853,9 @@ def plan(args, *, local_progress=None, stage=None):
                       'Execute small attention/linear kernel probes and save machine configuration'],
             'licenses': ['https://huggingface.co/OpenVDN/vdn-minimax-h3/blob/751739ee5b9e3ac802dca5d5111075fdaeb47885/LICENSE',
                          'https://huggingface.co/t8star/Vdn-Minimax-H3-Comfy',
-                         'https://docs.nvidia.com/cuda/eula/index.html']}
+                         # The toolkit whose license applies to this accelerator.
+                         ('https://www.hiascend.com/developer/download/community/result?module=cann' if ascend
+                          else 'https://docs.nvidia.com/cuda/eula/index.html')]}
     from .model_guidance import download_files
     value['download_files'] = download_files(model_entries)
     value['download_files_verified'] = all(status != 'found' for _, status in model_entries)
@@ -826,9 +907,18 @@ def display(value, ui=None, *, verbose=False):
         label = 'Peak disk space' if len(value['disks']) == 1 else 'Disk ' + disk['paths'][0]
         rows.append((label, '~%.1f GiB additional needed · %.1f GiB free' % (disk['needed_bytes']/GiB, disk['free_bytes']/GiB)))
     prepared = value.get('prepared_model')
-    rows.append(('Storage', 'Download slim %s model · no local conversion' % prepared_precision(prepared) if prepared else
-                 ('Reuse prepared %s cache' % ('ConvRot int8' if value.get('prepared_format') == 'int8_convrot' else 'FP8'))
-                 if value['reuse_cache'] else 'Prepare compact FP8 model'))
+    storage = {'int8_convrot': 'ConvRot int8', 'bf16': 'BF16'}.get(value.get('prepared_format'), 'FP8')
+    if prepared:
+        storage_row = 'Download slim %s model · no local conversion' % prepared_precision(prepared)
+    elif value['reuse_cache']:
+        storage_row = 'Reuse prepared %s cache' % storage
+    elif value.get('prepared_format') == 'bf16':
+        # A device without an FP8 product prepares the merged cache; there is no
+        # quantization pass to describe.
+        storage_row = 'Prepare merged BF16 cache'
+    else:
+        storage_row = 'Prepare compact FP8 model'
+    rows.append(('Storage', storage_row))
     if prepared:
         rows.append(('Prepared model', prepared['repo'] + ' · ' + prepared['scale_granularity'] +
                      (' · private, authorized HF token required' if prepared.get('private') else '')))
@@ -866,7 +956,8 @@ def display(value, ui=None, *, verbose=False):
     ui.panel('FreeVideo / ' + h['system'] + ' setup', rows)
     ui.write('Space and memory are estimates. Setup checks your GPU before marking it ready.\n')
     ui.write('Model licenses: MiniMax H3, H3 text encoder.\n' if value.get('device_backend') == 'mps' else
-             'Model / toolkit licenses: MiniMax H3, H3 text encoder, NVIDIA CUDA.\n')
+             'Model / toolkit licenses: MiniMax H3, H3 text encoder, '
+             + ('Ascend CANN.\n' if value.get('device_backend') == 'npu' else 'NVIDIA CUDA.\n'))
     ui.write('Use --verbose for full details and license links, or enter d at confirmation.\n')
     for error in value['errors']:
         ui.write('BLOCKED: ' + str(error) + '\n')
@@ -1221,6 +1312,10 @@ class Installer:
         save(self.root / 'machine.json', dict(saved, root=str(self.root), ready=False, setup_run=str(self.run_dir),
             storage=value.get('storage', 'compact'),
             disk_mode=value.get('disk_mode', 'normal'),
+            # The engine reads this back before setup finishes (continuation and image
+            # generation gate on it), so a half-installed Ascend machine must not look
+            # like a CUDA one.
+            device_backend=value.get('device_backend', 'cuda'),
             pending_environment_layout=self.layout, model_root=value['model_dir'],
             encoder_model_root=value.get('encoder_dir', saved.get('encoder_model_root')),
             wheel_cache=value.get('wheel_cache', saved.get('wheel_cache')),
@@ -1229,10 +1324,16 @@ class Installer:
 
     def device_environment(self, env):
         from .triton_compat import environment
-        return environment(self.root, dict(env,
-            CUDA_VISIBLE_DEVICES=self.plan['inventory']['selected_gpu']['uuid'],
+        selected = self.plan['inventory']['selected_gpu']
+        # CUDA pins by UUID so a reordered host cannot move the work to another card.
+        # Ascend selects by index instead, and its runtime takes no UUID here, so the
+        # CUDA spelling would name a device the CANN runtime cannot resolve. The cache
+        # folders are left to triton_compat.environment, which sets them for both.
+        pinned = ({'ASCEND_RT_VISIBLE_DEVICES': str(selected.get('index', '0'))}
+                  if setup_device() == 'npu' else
+                  {'CUDA_VISIBLE_DEVICES': selected['uuid']})
+        return environment(self.root, dict(env, **pinned,
             TRITON_CACHE_DIR=str(self.root / 'kernel-cache' / 'triton'),
-            CUDA_CACHE_PATH=str(self.root / 'kernel-cache' / 'cuda'),
             TORCHINDUCTOR_CACHE_DIR=str(self.root / 'kernel-cache' / 'inductor')))
 
     def start_monitor(self):
@@ -1462,6 +1563,67 @@ class Installer:
                                + setup_command_failure(label, log, child.returncode))
         return log
 
+    NPU_TRITON_WHEEL = ('vendor/wheels/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64'
+                        '.manylinux_2_28_aarch64.whl')
+    NPU_TRITON_SHA256 = '3e7b638ef04c333fd3eeeec35076c6636b708480f01a01d0f5a4c005ccb95521'
+
+    def check_npu_interpreter(self, python, label):
+        """Require the Ascend venv to see the interpreter's Torch and Torch-NPU.
+
+        There is no Torch wheel to install for Ascend, so the only thing this can
+        check is the failure that matters: the venv was built without
+        ``--system-site-packages``, or the interpreter it reused has no Torch-NPU.
+        The interpreter's own ImportError is the message, rather than a paraphrase.
+        """
+        return self.command(label + '-interpreter', [str(python), '-B', '-c', 'import torch, torch_npu'])
+
+    def install_npu_triton(self, python):
+        """Install the vendored Ascend Triton fork as the ``triton`` package.
+
+        ``--no-deps`` because the wheel provides ``triton`` itself and its metadata
+        would otherwise bring the CUDA Torch stack this venv must not acquire.
+        """
+        wheel = SOURCE / self.NPU_TRITON_WHEEL
+        if not wheel.is_file():
+            raise RuntimeError('The Ascend Triton wheel is missing from this installation: ' + str(wheel)
+                               + '. constraints/npu-runtime.txt records its source and hash.')
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        if digest != self.NPU_TRITON_SHA256:
+            raise RuntimeError('The Ascend Triton wheel does not match the sha256 recorded in '
+                               'constraints/npu-runtime.txt: ' + digest)
+        return self.command('npu-acceleration', [str(python), '-m', 'pip', 'install', '--no-deps', str(wheel)])
+
+    def check_npu_dependencies(self, python):
+        """The installed-package check, read by the environment's own pip.
+
+        The Ascend Triton wheel is installed --no-deps on purpose, because its
+        metadata names the fork's whole development stack (pytest, pandas, an exact
+        numpy) rather than what the package imports. Its lines are therefore expected
+        and are the only ones dropped here; anything else that pip reports is a real
+        inconsistency and stops setup.
+        """
+        result = subprocess_output.run_external([str(python), '-m', 'pip', 'check'],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        broken = [line for line in result.stdout.splitlines()
+                  if line.strip() and 'No broken requirements' not in line
+                  and 'triton-ascend' not in line and 'triton_ascend' not in line]
+        if result.returncode and broken:
+            raise RuntimeError('Installed packages are inconsistent:\n' + '\n'.join(broken[-20:]))
+        return result
+
+    def install_npu_companions(self, python):
+        """torchvision and torchaudio, from the CPU wheel index.
+
+        A step of its own because their +cpu builds live on PyTorch's own index, and
+        adding that index to the main resolution would let it satisfy ordinary
+        packages as well. The interpreter's Torch already satisfies their torch
+        requirement, so this fetches the two wheels and nothing behind them.
+        """
+        return self.command('npu-companions', [str(python), '-m', 'pip', 'install',
+            '--index-url', TORCH_CPU_INDEX,
+            '--extra-index-url', os.environ.get('PIP_INDEX_URL') or 'https://pypi.org/simple',
+            *reused_torch_companions()])
+
     def component_tasks(self, uv):
         """Dependencies, not serial UI stages, determine when work can start."""
         tasks = {}
@@ -1486,7 +1648,16 @@ class Installer:
             def environment(folder=venv, executable=python, label=name):
                 if executable.exists() and environment_seeded(folder):
                     return None
-                command = [uv, 'venv', '--seed', '--python', self.versions['python']]
+                if setup_device() == 'npu':
+                    # The Ascend venv has to be built from the interpreter that
+                    # carries the CANN-matched Torch-NPU. A version spec makes uv
+                    # fetch its own CPython, whose site-packages hold no torch, so
+                    # --system-site-packages would inherit nothing and the engine
+                    # would have no accelerator at all. That interpreter is the one
+                    # the launcher already chose to run this installer.
+                    command = [uv, 'venv', '--seed', '--python', sys.executable, '--system-site-packages']
+                else:
+                    command = [uv, 'venv', '--seed', '--python', self.versions['python']]
                 # The Python file came back (restored from quarantine) without
                 # the seed packages: keep it and add them. Without the file, the
                 # folder is a leftover that uv replaces.
@@ -1504,6 +1675,10 @@ class Installer:
                         raise
                     raise RuntimeError(removed + str(error)) from error
             task(name + '-venv', environment, ('python',), writer)
+            if setup_device() == 'npu':
+                task(name + '-interpreter', lambda executable=python, label=name:
+                     self.check_npu_interpreter(executable, label), (name + '-venv',), writer)
+                continue
             command = [uv, 'pip', 'install', '--python', python, *spec['torch'], '-c', constraints_file(name, self.system)]
             family = 'torch-' + spec['cuda'] + '-' + spec['torch'][0].split('==')[1]
             def torch_packages(label=name, argv=command, group=family, role=spec, executable=python):
@@ -1533,11 +1708,38 @@ class Installer:
                  (name + '-venv',), writer)
         name = 'unified' if self.layout == 'unified' else 'engine'
         python, encoder_python = self.pythons['engine'], self.pythons['encoder']
-        command = [uv, 'pip', 'install', '--python', python, '-e', str(SOURCE) + '[runtime]',
-                   '-c', constraints_file(name, self.system), 'pip', 'ninja', 'packaging', 'wheel', 'setuptools']
+        if setup_device() == 'npu':
+            # The extra's requirements are named one by one because it pins the CUDA
+            # Triton, and a constraints file can only pin what is already required.
+            # The Ascend fork arrives from the vendored wheel in the next task.
+            #
+            # pip, not uv: this environment reuses the interpreter's Torch-NPU through
+            # --system-site-packages, and uv's resolver does not count those packages
+            # as installed. It resolved torch from the index instead, and torch's PyPI
+            # metadata pulls the whole CUDA stack in behind it (nvidia-cudnn-cu13 alone
+            # is 620 MiB) for an accelerator that cannot use any of it. pip reads the
+            # environment's Torch as satisfying `torch`, so the edge stops there.
+            command = [str(python), '-m', 'pip', 'install', '-e', str(SOURCE),
+                       *runtime_requirements('npu'), 'comfy-aimdo==0.5.6',
+                       '-c', constraints_file(name, self.system),
+                       'pip', 'ninja', 'packaging', 'wheel', 'setuptools',
+                       # constraints/npu-runtime.txt only pins what is required, and the
+                       # Ascend Triton backend imports pybind11 for its launcher headers.
+                       # Naming it here is what installs it; pinning it there sets the
+                       # version.
+                       'pybind11']
+        else:
+            command = [uv, 'pip', 'install', '--python', python, '-e', str(SOURCE) + '[runtime]',
+                       '-c', constraints_file(name, self.system), 'pip', 'ninja', 'packaging', 'wheel', 'setuptools']
         if self.layout == 'unified':
             command += ['-r', SOURCE / 'constraints/encoder-runtime.txt']
-        task('runtime', lambda: self.packages(name + '-packages', command), (name + '-torch',), ('environment:' + name,))
+        previous = (name + '-interpreter',) if setup_device() == 'npu' else (name + '-torch',)
+        task('runtime', lambda: self.packages(name + '-packages', command), previous, ('environment:' + name,))
+        if setup_device() == 'npu':
+            task('npu-acceleration', lambda executable=python: self.install_npu_triton(executable), ('runtime',),
+                 ('environment:' + name,))
+            task('npu-companions', lambda executable=python: self.install_npu_companions(executable),
+                 ('npu-acceleration',), ('environment:' + name,))
         # Enqueue downloads as soon as their SDKs exist, before waiting for
         # source setup, encoder checks or acceleration compilation.
         task('models', lambda: self.command('models', [python, '-m', 'freevideo_engine.provision',
@@ -1557,18 +1759,32 @@ class Installer:
             'freevideo_engine.encode_worker', '--comfy-root', comfy, '--check-library']),
              (encoder_after, 'encoder-source'), ('environment:unified' if self.layout == 'unified' else 'environment:encoder',))
         if self.system == 'Windows':
-            task('windows-check', lambda: self.command('windows-runtime-check', [python, '-c',
-                'import torch,triton,safetensors,comfy_kitchen,comfy_aimdo; '
-                'assert torch.cuda.is_available(), "CUDA unavailable; check NVIDIA driver and Windows DLL errors above"; '
-                'print("Windows runtime imports passed; GPU kernel probes follow")']), ('runtime',), ('environment:' + name,))
+            # The CUDA spelling names the packages a CUDA Windows host must import;
+            # an Ascend installation asserts its own runtime instead, so the check
+            # never asks for a CUDA stack that installation has no use for.
+            probe = ('import torch,torch_npu; '
+                     'assert torch.npu.is_available(), "Torch-NPU unavailable; check the CANN runtime and driver above"; '
+                     'print("Windows runtime imports passed; GPU kernel probes follow")'
+                     if setup_device() == 'npu' else
+                     'import torch,triton,safetensors,comfy_kitchen,comfy_aimdo; '
+                     'assert torch.cuda.is_available(), "CUDA unavailable; check NVIDIA driver and Windows DLL errors above"; '
+                     'print("Windows runtime imports passed; GPU kernel probes follow")')
+            task('windows-check', lambda: self.command('windows-runtime-check', [python, '-c', probe]),
+                 ('runtime',), ('environment:' + name,))
         overlap = (self.plan.get('model_transfer') or {}).get('overlap_build', True)
-        # Linux builds SageAttention from a Git checkout.
-        task('sage', lambda: self.install_sage(uv, python), ('runtime', 'git') if overlap else ('runtime', 'git', 'models'),
-             ('environment:' + name,))
+        if setup_device() != 'npu':
+            # SageAttention is a CUDA attention library built from a Git checkout, and
+            # install_sage reads torch.version.cuda and the compute capability to build
+            # it. An Ascend installation runs the NPU backend's own attention instead,
+            # which is also why dependency_status does not expect it there.
+            task('sage', lambda: self.install_sage(uv, python),
+                 ('runtime', 'git') if overlap else ('runtime', 'git', 'models'),
+                 ('environment:' + name,))
         if self.plan.get('disk_mode') == 'extreme':
             # Finish all environments before models occupy most of the disk.
             # In particular retain the uv cache until ComfyUI has reused it.
-            tasks['sage']['after'] = ('runtime', 'git')
+            if 'sage' in tasks:
+                tasks['sage']['after'] = ('runtime', 'git')
             prerequisites = tuple(key for key in tasks if key != 'models')
             frontend = self.plan.get('frontend') or {}
             if frontend.get('separate'):
@@ -1937,7 +2153,11 @@ class Installer:
             'setup_run': str(self.run_dir), 'ready': True}
 
     def device_configuration(self):
-        return {'gpu_uuid': self.plan['inventory']['selected_gpu']['uuid']}
+        # device_backend travels with the record: the engine reads it back to decide
+        # what this installation's accelerator supports, so a finished Ascend machine
+        # must not look like a CUDA one.
+        return {'gpu_uuid': self.plan['inventory']['selected_gpu']['uuid'],
+                'device_backend': self.plan.get('device_backend', 'cuda')}
 
     def check_kernels(self, python, kernel_report):
         # Kernel probes execute real CUDA work and take roughly a minute on a
@@ -1951,12 +2171,21 @@ class Installer:
         receipt = (reusable_kernel_receipt(cached_kernel, hardware_data)
                    if isinstance(hardware_data, dict) else None)
         if receipt is None:
-            self.command('kernels', [python, '-m', 'freevideo_engine', 'doctor', '--probe', '--require-paths', '--out', kernel_report])
+            # doctor probes the device it is told about; without this it reads the
+            # CUDA detector, which refuses a host that has no CUDA at all.
+            device = ['--device', 'npu'] if setup_device() == 'npu' else []
+            self.command('kernels', [python, '-m', 'freevideo_engine', 'doctor', '--probe', '--require-paths',
+                                     *device, '--out', kernel_report])
         else:
             save(kernel_report, receipt)
             self.ui.event('setup_cache', key='kernels', detail='Reused matching GPU kernel checks')
 
     def record_kernel_validation(self, results, kernel_report):
+        if 'sage' not in results:
+            # An Ascend installation has no SageAttention build to validate: it runs the
+            # NPU backend's own attention, and that probe's result is already in the
+            # receipt this step saved.
+            return
         sage_manifest = results['sage']
         sage_record = json.loads(sage_manifest.read_text(encoding='utf-8'))
         kernels = json.loads(kernel_report.read_text(encoding='utf-8'))
@@ -1965,6 +2194,15 @@ class Installer:
         save(sage_manifest, sage_record)
 
     def prepare_tools(self):
+        # A caller-provided uv is used as-is. The pinned Linux download and the
+        # tools path installation_cleanup.uv_path expects are both x86_64, and
+        # install.py already honours this variable for the same reason.
+        supplied = os.environ.get('FREEVIDEO_UV')
+        if supplied:
+            executable = Path(supplied)
+            if not executable.is_file():
+                raise RuntimeError('FREEVIDEO_UV does not name an existing uv executable: ' + str(executable))
+            return executable
         uv_spec = self.versions['uv']
         if self.system == 'Windows':
             from .uv_bootstrap import prepare_windows
@@ -2034,8 +2272,16 @@ class Installer:
                                 '--prepare', '--out', prepared])
         self.ui.phase('Verify installation on your GPU', total - 2, total)
         for name, executable in pythons.items():
-            self.command(name + '-dependency-check', [uv, 'pip', 'check', '--python', executable])
-            self.command(name + '-freeze', [uv, 'pip', 'freeze', '--python', executable])
+            if setup_device() == 'npu':
+                # uv's check and freeze do not count the packages this environment
+                # reuses through --system-site-packages, so they report Torch and its
+                # companions as missing. The environment's own pip reads the same
+                # interpreter and sees them.
+                self.check_npu_dependencies(executable)
+                self.command(name + '-freeze', [str(executable), '-m', 'pip', 'freeze'])
+            else:
+                self.command(name + '-dependency-check', [uv, 'pip', 'check', '--python', executable])
+                self.command(name + '-freeze', [uv, 'pip', 'freeze', '--python', executable])
         kernel_report = self.run_dir / 'kernel-capabilities.json'
         self.check_kernels(python, kernel_report)
         require_int8_kernels(self.plan, kernel_report)
@@ -2176,6 +2422,10 @@ def run_main(argv, shown):
     parser.add_argument('--gpu', help='Physical nvidia-smi index or full GPU UUID')
     parser.add_argument('--environment', choices=('unified', 'dual'),
                         help='New installs default to unified; updates retain their saved layout. Existing environments are kept when switching.')
+    parser.add_argument('--device', choices=('cuda', 'npu'),
+                        help='Accelerator this installation targets. Ascend (npu) reuses the interpreter\'s '
+                             'Torch-NPU, keeps the single unified environment, and takes Triton from the '
+                             'vendored Ascend wheel instead of the CUDA one.')
     parser.add_argument('--models', type=Path, help='Reuse/download official model files in this directory')
     parser.add_argument('--sampling-caches', action=argparse.BooleanOptionalAction, default=None,
                         help='Install every quality level in advance (default for new installations; existing ones keep '
@@ -2229,6 +2479,10 @@ def run_main(argv, shown):
                         help='Linux: finish after the engine instead of installing ComfyUI and opening FreeVideo')
     parser.add_argument('--approved-plan', type=Path, help='GUI confirmation receipt; changed paths, models or larger disk/download requirements require a new review')
     args = parser.parse_args(argv)
+    if getattr(args, 'device', None):
+        # environments.setup_device reads this, so the whole plan and every later
+        # step asks the same question and gets the same answer.
+        os.environ['FREEVIDEO_SETUP_DEVICE'] = args.device
     if not 1 <= args.network_timeout <= 30:
         parser.error('--network-timeout must be between 1 and 30 seconds')
     if args.hardware_json and not args.plan:

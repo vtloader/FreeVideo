@@ -709,14 +709,135 @@ def adaln_extra_bytes(canvas=None):
     return max(0, steps - 8) * times_per_step * 50 * 3 * 6 * 5376 * 2
 
 
+def device_admission(hardware, *, device='cuda'):
+    """Device-family admission, so CUDA rules are never applied to Ascend facts."""
+    if device == 'cuda':
+        return hardware.cuda_compatibility()
+    if device == 'npu':
+        from .npu_hardware import compatibility
+        return compatibility(hardware)
+    raise ValueError('Resource planning device must be cuda or npu')
+
+
+# One BF16 transformer block, measured from the prepared cache this engine reads
+# (blocks/NN safetensors, 50 of them). The CUDA model uses the FP8 block size;
+# Ascend binds BF16, and that is what the NPU backend loads.
+NPU_BLOCK_BYTES = 856_315_016
+NPU_TRANSFORMER_BLOCKS = 50
+# The rest of that cache: 50 adaln groups (520418544 B each) and the root
+# safetensors (1723250184 B). They are read on every step, so the placement keeps
+# room for them the way the CUDA bands keep room for their own workspace.
+NPU_FIXED_WEIGHTS_BYTES = 50 * 520_418_544 + 1_723_250_184
+
+
+def npu_placement(hardware, *, vram_gib=None, ram_gib=None, attention='auto',
+                  gpu_reserve_gib=None, ram_reserve_gib=None, available_backends=None,
+                  canvas=None, precision='bf16'):
+    """Ascend placement: BF16 blocks, no pinned host prefix, VBAR offload.
+
+    The measured block size replaces the CUDA one, and the knobs describing
+    CUDA-only machinery (int8/FP8 compute, streamed weight sources, pinned host
+    prefixes, CUDA packing) are held at the values the NPU backend implements.
+    What Ascend has not measured yet stays conservative: blocks that do not fit
+    are left to the layer residency instead of being pinned on the host, and the
+    VAE decoder keeps its own offload defaults.
+    """
+    if precision not in ('bf16', 'fp8', 'int8'):
+        raise ValueError('The NPU plans BF16 weights; this request prepared ' + str(precision))
+    # A quantized cache is read back into BF16 by backends/npu_linears, so every
+    # residency slot and every block still holds BF16 bytes. The device footprint
+    # is therefore the one the constants below were measured on, and only the cache
+    # on disk is smaller. NPU_FIXED_WEIGHTS_BYTES stays an upper bound for the
+    # adaln groups and root safetensors, which is the conservative direction.
+
+    report = npu_capacity(hardware, vram_gib=vram_gib, ram_gib=ram_gib,
+                          gpu_reserve_gib=gpu_reserve_gib, ram_reserve_gib=ram_reserve_gib)
+    admission = report['admission']
+    if admission['error']:
+        raise ValueError(admission['error'])
+
+    from .backends import get_backend
+    candidates = list(get_backend('npu').capabilities.attention_candidates)
+    if attention == 'auto':
+        attention = candidates[0] if candidates else ''
+    elif attention not in candidates:
+        raise ValueError('The Ascend backend runs %s attention, not %r'
+                         % (list(candidates), attention))
+
+    workspace = adaln_extra_bytes(canvas) if canvas is not None else 0
+    usable = max(0, report['gpu_budget_bytes'] - workspace - NPU_FIXED_WEIGHTS_BYTES)
+    resident = min(NPU_TRANSFORMER_BLOCKS, int(usable // NPU_BLOCK_BYTES))
+    offloaded = NPU_TRANSFORMER_BLOCKS - resident
+
+    # Four windows per launch, measured on the 142-frame x 510-token x 56-head x
+    # 128 geometry: the looped window leg runs 189.1 ms at a batch of one, 186.2 at
+    # two, 184.4 at four, then 197.0 at eight and 196.7 at sixteen. Every width is
+    # bitwise identical to a batch of one there, so this is a pure scheduling
+    # choice. Four costs 147 MiB of peak; eight costs 2.3 GiB more and is slower,
+    # so the smaller batch wins on both axes.
+    engine = dict(attention=attention, prefetch=False, adaln_cache=True,
+                  adaln_disk_cache=True, inference_kernels=False, ff_chunk=0, head_chunk=0,
+                  projection_chunk=0, offload_refiner=False, attention_cpu_outputs=False,
+                  grouped_attention_outputs=False, residual_offload=False,
+                  fp8_ff_recompute=False, cache_refined_text=False, resident_blocks=resident,
+                  pin_host_gb=0., stream_weights=False, window_batch=4, linear_compute='bf16')
+    decoder = dict(offload=True, prefetch=False, tile_group=True, preload=False,
+                   pin_weights=False, stream_output=True, stream_weights=False,
+                   resident_blocks=0, linear_compute_cache=False)
+    notes = ['Ascend placement from the measured BF16 block size (%d B): %d of %d transformer '
+             'blocks stay resident, %d are faulted through the layer residency (comfy-aimdo VBAR).'
+             % (NPU_BLOCK_BYTES, resident, NPU_TRANSFORMER_BLOCKS, offloaded)]
+    notes.append('No host-pinned weight prefix and no streamed weight source: the NPU backend '
+                 'implements neither.')
+
+    return Policy(2, hardware.to_dict(), report['gpu_budget_bytes'], report['ram_budget_bytes'],
+                  report['gpu_system_reserve_bytes'], report['ram_system_reserve_bytes'],
+                  '', engine, decoder,
+                  'Ascend placement replaces the CUDA block model with the measured BF16 one.',
+                  notes)
+
+
+def npu_capacity(hardware, *, vram_gib=None, ram_gib=None,
+                 gpu_reserve_gib=None, ram_reserve_gib=None):
+    """Admitted Ascend capacity and reserves; placement is not calibrated yet.
+
+    ``BLOCK_BYTES`` is one prepared FP8 transformer block and every placement
+    band around it was measured on CUDA hardware, so this report stops at the
+    device-independent capacity arithmetic instead of inventing a BF16 weight
+    model for the NPU.
+    """
+    admission = device_admission(hardware, device='npu')
+    if admission['error']:
+        raise ValueError(admission['error'])
+    budget = resource_budget(hardware, vram_gib=vram_gib, ram_gib=ram_gib,
+                             gpu_reserve_gib=gpu_reserve_gib, ram_reserve_gib=ram_reserve_gib)
+    from .backends import get_backend
+    capabilities = get_backend('npu').capabilities
+    return dict(device='npu', admission=admission,
+                attention_candidates=list(capabilities.attention_candidates),
+                linear_policies=list(capabilities.linear_policies),
+                memory_model=capabilities.memory_model,
+                **{name: budget[name] for name in (
+                    'gpu_capacity_bytes', 'gpu_available_bytes', 'ram_capacity_bytes',
+                    'ram_available_bytes', 'gpu_budget_bytes', 'ram_budget_bytes',
+                    'gpu_system_reserve_bytes', 'ram_system_reserve_bytes')})
+
+
 def choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto',
            gpu_reserve_gib=None, ram_reserve_gib=None, available_backends=None, canvas=None,
            demonstrated_ram_bytes=None, allow_capacity_trial=False, stage='generation',
-           lora_max_block_bytes=0, lora_root_bytes=0, precision='fp8'):
+           lora_max_block_bytes=0, lora_root_bytes=0, precision='fp8', device='cuda'):
     """precision is the prepared cache's: int8 caches run int8 projections."""
     from .geometry import geometry
     if stage not in ('encoding', 'generation'):
         raise ValueError('Resource planning stage must be encoding or generation')
+    if device == 'npu':
+        return npu_placement(hardware, vram_gib=vram_gib, ram_gib=ram_gib, attention=attention,
+                             gpu_reserve_gib=gpu_reserve_gib, ram_reserve_gib=ram_reserve_gib,
+                             available_backends=available_backends, canvas=canvas,
+                             precision=precision)
+    if device != 'cuda':
+        raise ValueError('Resource planning device must be cuda or npu')
     if precision not in ('fp8', 'int8'):
         raise ValueError('Resource planning needs the FP8 or int8 prepared model')
     int8 = precision == 'int8'

@@ -479,6 +479,20 @@ class Monitor:
 
 
 
+def device_monitor(path, interval=0.05, device=None, pid=None):
+    """A started whole-device sampler for whichever device driver this host has.
+
+    NVML first, then Ascend's DCMI, which reports the same whole-device facts
+    including other programs. A host with neither is reported as no sampling,
+    so a caller can say so instead of failing the request that asked for it.
+    """
+    try:
+        return Monitor(path, interval=interval, device=device, pid=pid).start()
+    except (OSError, RuntimeError):
+        from . import npu_monitor
+        return npu_monitor.monitor(path, interval=interval, device=device, pid=pid)
+
+
 def step_activity(csv_path, steps, *, limit_bytes=64 * 2**20):
     """Add each sampling step's whole-device NVML samples to it as `device_activity`.
 

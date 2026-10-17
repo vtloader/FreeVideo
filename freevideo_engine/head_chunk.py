@@ -4,6 +4,7 @@ Reuses upstream's head-sliced linear branch (originally used by Ulysses).
 No heads, windows, text states or scan frames are dropped. Sliced GEMMs can
 change floating-point reduction order and must be reported as an ablation.
 """
+from .torch_device import device_module, device_name
 from contextlib import nullcontext
 import gc
 import types
@@ -68,8 +69,8 @@ def release_readouts(policy):
         # in flight at a pass's first layer (residual staging, the previous
         # pass's last tiles). Returning them then broke the next copy on
         # Windows with cudaErrorInvalidValue; wait for the device first.
-        if torch.cuda.is_initialized():
-            torch.cuda.synchronize()
+        if device_module(torch).is_initialized():
+            device_module(torch).synchronize()
         from .torch_compat import empty_host_cache
         empty_host_cache(torch)
 
@@ -233,7 +234,7 @@ def install_head_chunks(transformer, policy, chunk, cpu_outputs=False, projectio
                     attn.anchor_frames, attn.enable_text_state, policy.window_batch,
                     policy.backend, policy.window_varlen)
         concurrent = parallelism > 1 and getattr(attn, '_freevideo_parallel_warm', None) == warm_key
-        parent = torch.cuda.current_stream(x.device) if concurrent else None
+        parent = device_module(torch).current_stream(x.device) if concurrent else None
         streams = []
         if concurrent:
             policy.prepare(layout, bounds, x.device, attn.anchor_frames, batches=True)
@@ -241,7 +242,7 @@ def install_head_chunks(transformer, policy, chunk, cpu_outputs=False, projectio
             _gather_indices(bounds, layout.num_frames, x.device)
             stream_key = (str(x.device), parallelism)
             if getattr(policy, 'head_stream_key', None) != stream_key:
-                policy.head_streams = [torch.cuda.Stream(device=x.device) for _ in range(parallelism)]
+                policy.head_streams = [device_module(torch).Stream(device=x.device) for _ in range(parallelism)]
                 policy.head_stream_key = stream_key
             streams = policy.head_streams
             # Inputs and disjoint output planes belong to the parent allocator.
@@ -256,7 +257,7 @@ def install_head_chunks(transformer, policy, chunk, cpu_outputs=False, projectio
         try:
             fresh = not streams and len(x) not in COLLECTED_LENGTHS
             for index, start in enumerate(range(0, attn.num_heads, chunk)):
-                with torch.cuda.stream(streams[index % len(streams)]) if streams else nullcontext():
+                with device_module(torch).stream(streams[index % len(streams)]) if streams else nullcontext():
                     group(start)
                 if fresh:
                     gc.collect()
@@ -274,7 +275,7 @@ def install_head_chunks(transformer, policy, chunk, cpu_outputs=False, projectio
         soft_scale = soft_scale.finish() if soft_scale is not None else None
         linear_scale = linear_scale.finish() if linear_scale is not None else None
         if grouped_outputs:
-            torch.cuda.current_stream(x.device).synchronize()
+            device_module(torch).current_stream(x.device).synchronize()
             out = x.new_empty((len(x), output_width))
             for rows, part in soft.project(lambda part: part, out, len(x)):
                 scale = row_scale(soft_scale, rows) if soft_scale is not None else None
@@ -285,7 +286,7 @@ def install_head_chunks(transformer, policy, chunk, cpu_outputs=False, projectio
             return out
         if cpu_outputs:
             # All D2H writes must finish before the pinned outputs are read by H2D.
-            torch.cuda.current_stream(x.device).synchronize()
+            device_module(torch).current_stream(x.device).synchronize()
             # Project bounded row slices directly from the host readout planes.
             # Copying whole planes back would retain >2 GB of temporary buffers.
             out = x.new_empty((len(x), output_width))

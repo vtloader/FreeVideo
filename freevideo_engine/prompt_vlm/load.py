@@ -96,5 +96,6 @@ def resident(folder, torch, device, precision):
     if tied:
         model.lm_head.weight = model.model.language_model.embed_tokens.weight
     model = model.to(device)
-    torch.cuda.empty_cache()  # Merge and quantize temporaries; KV space comes next.
+    from ..torch_device import device_module
+    device_module(torch).empty_cache()  # Merge and quantize temporaries; KV space comes next.
     return model

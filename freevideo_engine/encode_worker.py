@@ -13,6 +13,7 @@ import sys
 import time
 from .monitoring import save
 from .processes import worker_signals
+from .torch_device import device_module, device_name
 
 PACKAGE = Path(__file__).resolve().parent
 
@@ -65,7 +66,7 @@ def resolve_encoder(folder_paths, name):
 
 def encoder_on_gpu(clip):
     patcher = clip.patcher
-    return (getattr(patcher.current_loaded_device(), 'type', None) == 'cuda' and
+    return (getattr(patcher.current_loaded_device(), 'type', None) in ('cuda', 'npu') and
             patcher.loaded_size() >= patcher.model_size() > 0)
 
 
@@ -101,16 +102,16 @@ def preload(clip, request, resident):
         else:
             check()
             save(request['metrics'], result)
-            _, total = torch.cuda.mem_get_info()
+            _, total = device_module(torch).mem_get_info()
             # The native planner already honors the live budget; the allocator
             # additionally bounds an unexpected speculative allocation.
-            torch.cuda.set_per_process_memory_fraction(min(1., resident.gpu_budget/total))
+            device_module(torch).set_per_process_memory_fraction(min(1., resident.gpu_budget/total))
             try:
                 with interruptible_load(clip.patcher, check):
                     memory.load_models_gpu([clip.patcher], memory_required=0)
-                    torch.cuda.synchronize()
+                    device_module(torch).synchronize()
             finally:
-                torch.cuda.set_per_process_memory_fraction(1.)
+                device_module(torch).set_per_process_memory_fraction(1.)
             result.update(state='ready' if encoder_on_gpu(clip) else 'partial',
                           reason='Prepared weights in spare VRAM without encoding a prompt')
     except (PreloadCancelled, MemoryError, torch.OutOfMemoryError) as error:
@@ -121,8 +122,8 @@ def preload(clip, request, resident):
         resident.drop('encoder', 'Speculative preload failed; partial placement discarded')
         raise
     result.update(gpu_bytes_after=gpu_bytes(clip), elapsed_seconds=time.perf_counter()-started,
-                  torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                  torch_peak_reserved_bytes=torch.cuda.max_memory_reserved())
+                  torch_peak_allocated_bytes=device_module(torch).max_memory_allocated(),
+                  torch_peak_reserved_bytes=device_module(torch).max_memory_reserved())
     save(request['metrics'], result)
     print(json.dumps(dict(event='encoder_prewarm_complete', **result)), flush=True)
     return result
@@ -265,9 +266,9 @@ def _encode(args, request, resident, trace):
     phase('encoder_cuda_setup')
     if idle:
         from .idle_encoder import gpu_preload_budget
-        free, total = torch.cuda.mem_get_info()
+        free, total = device_module(torch).mem_get_info()
         decision = gpu_preload_budget(resident.gpu_budget, request.get('idle_resources'),
-            free=free, total=total, reserved=torch.cuda.memory_reserved())
+            free=free, total=total, reserved=device_module(torch).memory_reserved())
         request['idle_resource_decision'] = decision
         resident.configure(decision['budget_bytes'], resident.ram_budget,
                            gpu_reserve=decision['system_reserve_bytes'])
@@ -289,7 +290,7 @@ def _encode(args, request, resident, trace):
         budget = float(budget)
         if budget < 4:
             raise ValueError('GPU budget must be at least 4 decimal GB')
-        available, total = torch.cuda.mem_get_info()
+        available, total = device_module(torch).mem_get_info()
         # A budget above the device's capacity is the automatic policy on a
         # large card, not a bad request: an H200's own plan is about 145 GB and
         # a fixed 128 GB ceiling refused the request before encoding started.
@@ -365,7 +366,7 @@ def _encode(args, request, resident, trace):
         elif idle and (Path(request['cancel']).exists() or not resident.ram_fits() or resident.available() < 2*2**30):
             return dict(state='skipped', reason='No spare live memory, or a foreground request arrived')
         import comfy.model_management
-        real_free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        real_free = device_module(torch).mem_get_info()[0] + device_module(torch).memory_reserved() - device_module(torch).memory_allocated()
         reserve_gib = max(.5, (real_free - resident.available() + 1e9) / 2**30)
         comfy.model_management.EXTRA_RESERVED_VRAM = reserve_gib * 2**30
     encoder_cache_hit = clip is not None
@@ -417,7 +418,7 @@ def _encode(args, request, resident, trace):
     if resident is not None and encoder_cache_hit:
         resident.encoder_room(clip, tokens, estimated)
         loading['resident_admission'] = list(resident.decisions)
-        real_free = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        real_free = device_module(torch).mem_get_info()[0] + device_module(torch).memory_reserved() - device_module(torch).memory_allocated()
         comfy.model_management.EXTRA_RESERVED_VRAM = max(.5*2**30, real_free - resident.available() + 1e9)
     # Time the loader the native encode path itself invokes. Wrapping it keeps
     # call order, token-dependent memory planning and arithmetic unchanged.
@@ -440,7 +441,7 @@ def _encode(args, request, resident, trace):
             # The native planner keeps 0.8 GiB beside the reserve; leave this attempt's room.
             memory.EXTRA_RESERVED_VRAM = max(memory.EXTRA_RESERVED_VRAM, current['need'] - int(.8 * 2**30))
         result = native_load(*values, **kwargs)
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         stop_read_ahead(trace)
         if not encoder_cache_hit:
             start_model_read_ahead(trace, request)
@@ -540,11 +541,11 @@ def _encode(args, request, resident, trace):
                 early_reference['conditions'].append(dict(start_step=step, value=stage_value))
                 loading.setdefault('early_reference_attempts', []).append(dict(start_step=step, attempts=stage_attempts))
                 del stage_encoded
-            torch.cuda.synchronize()
+            device_module(torch).synchronize()
             loading['early_reference_extra_encode_seconds'] = time.perf_counter() - extra_started if stages[1:] else 0.
         # Finish async forward work at the existing conditioning boundary, so
         # it is not attributed to packing/saving on the host.
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         from .encoder_memory import release_cast_buffers, snapshot
         loading['cast_buffers'] = release_cast_buffers(memory, torch)
         phase('encoder_conditioning_pack', gpu=snapshot(torch, clip, memory))
@@ -560,7 +561,7 @@ def _encode(args, request, resident, trace):
     value['task'] = task
     if early_reference is not None:
         value['early_reference'] = early_reference
-    torch.cuda.synchronize()
+    device_module(torch).synchronize()
     prompt_encode_seconds = time.perf_counter() - encode_started
     # Keyframe and reference-media encoding read the drive themselves.
     stop_model_read_ahead(trace)
@@ -584,14 +585,14 @@ def _encode(args, request, resident, trace):
         # Only the encoder is read; the decoder in the shared shards is skipped.
         vae, _ = load_video_encoder(request['base'], before_upload=None if resident is None else
                                     lambda model: resident.input_vae_room(model, dict(width=width, height=height)))
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         keyframe_metrics['keyframe_vae_load_seconds'] = time.perf_counter() - vae_started
         vae_started = time.perf_counter()
         with torch.no_grad():
             conditions = [encode_vae_condition(vae,
-                torch.from_numpy(np.array(image)).to('cuda').permute(2, 0, 1)[None, :, None],
+                torch.from_numpy(np.array(image)).to(device_name(torch)).permute(2, 0, 1)[None, :, None],
                 PIXEL_MEAN, PIXEL_STD, 42).cpu() for image in images]
-        torch.cuda.synchronize()
+        device_module(torch).synchronize()
         keyframe_metrics['keyframe_vae_encode_seconds'] = time.perf_counter() - vae_started
         value.update(keyframe_anchors=['first', 'last'], condition_latents=conditions,
                      keyframe_files=[keyframes['first'], keyframes['last']], width=width, height=height)
@@ -637,8 +638,8 @@ def _encode(args, request, resident, trace):
                'encoder_compute_seconds': max(0., prompt_encode_seconds - tokenize_seconds - transfer_seconds[0]),
                'task': task,
                'conditioning_shape': list(value['prompt_embeds'].shape), 'output': str(output),
-               'torch_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
-               'torch_peak_reserved_bytes': torch.cuda.max_memory_reserved(), 'success': True}
+               'torch_peak_allocated_bytes': device_module(torch).max_memory_allocated(),
+               'torch_peak_reserved_bytes': device_module(torch).max_memory_reserved(), 'success': True}
     return metrics
 
 

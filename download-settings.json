@@ -1,0 +1,295 @@
+{
+  "source": "auto",
+  "proxy_mode": "auto",
+  "probe": {
+    "measured_at": 1792156842.3176723,
+    "method": "http-body-v2",
+    "proxy_mode": "auto",
+    "sources": {
+      "pypi": [
+        {
+          "id": "huaweicloud",
+          "ok": true
+        }
+      ],
+      "models": [
+        {
+          "id": "hf-mirror",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 1321709.6686759077,
+          "seconds": 5.813376169884577,
+          "bytes": 3965537,
+          "speed_measured": true,
+          "startup_seconds": 2.8118520400021225,
+          "ttfb_seconds": 2.8118520400021225,
+          "transfer_seconds": 3.000307929934934,
+          "measured_bytes": 3965536,
+          "stop_reason": "time-limit",
+          "score": 1189915.8916602018,
+          "body_stalled": false
+        },
+        {
+          "id": "user",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 421550.2182251967,
+          "seconds": 6.536270249867812,
+          "bytes": 1264748,
+          "speed_measured": true,
+          "startup_seconds": 3.5353100299835205,
+          "ttfb_seconds": 3.5353100299835205,
+          "transfer_seconds": 3.0002285500522703,
+          "measured_bytes": 1264747,
+          "stop_reason": "time-limit",
+          "score": 403623.397871778,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": false,
+          "score": 0.0
+        }
+      ],
+      "vdn-models": [
+        {
+          "id": "modelscope",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 9337608.196973046,
+          "seconds": 3.445029409835115,
+          "bytes": 28015611,
+          "speed_measured": true,
+          "startup_seconds": 0.4435821399092674,
+          "ttfb_seconds": 0.4435821399092674,
+          "transfer_seconds": 3.0002983000595123,
+          "measured_bytes": 28015610,
+          "stop_reason": "time-limit",
+          "score": 8311613.434898363,
+          "body_stalled": false
+        },
+        {
+          "id": "user",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 316864.2161406869,
+          "seconds": 6.392441580072045,
+          "bytes": 950670,
+          "speed_measured": true,
+          "startup_seconds": 3.3908960700500757,
+          "ttfb_seconds": 3.3908960700500757,
+          "transfer_seconds": 3.000240959925577,
+          "measured_bytes": 950669,
+          "stop_reason": "time-limit",
+          "score": 307032.65790260123,
+          "body_stalled": false
+        },
+        {
+          "id": "hf-mirror",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 146735.41719295172,
+          "seconds": 5.536077030003071,
+          "bytes": 440246,
+          "speed_measured": true,
+          "startup_seconds": 2.5350039100740105,
+          "ttfb_seconds": 2.5350039100740105,
+          "transfer_seconds": 3.000264069996774,
+          "measured_bytes": 440245,
+          "stop_reason": "time-limit",
+          "score": 145126.58528923494,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": false,
+          "score": 0.0
+        }
+      ],
+      "edge-models": [
+        {
+          "id": "user",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 3760932.9282480725,
+          "seconds": 5.138341119978577,
+          "bytes": 11284009,
+          "speed_measured": true,
+          "startup_seconds": 2.137208820087835,
+          "ttfb_seconds": 2.137208820087835,
+          "transfer_seconds": 3.000321520026773,
+          "measured_bytes": 11284008,
+          "stop_reason": "time-limit",
+          "score": 3034116.268177944,
+          "body_stalled": false
+        },
+        {
+          "id": "modelscope",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 1659765.0359695097,
+          "seconds": 5.198410770157352,
+          "bytes": 4979759,
+          "speed_measured": true,
+          "startup_seconds": 2.196992910001427,
+          "ttfb_seconds": 2.196992910001427,
+          "transfer_seconds": 3.000278890132904,
+          "measured_bytes": 4979758,
+          "stop_reason": "time-limit",
+          "score": 1497072.3041993328,
+          "body_stalled": false
+        },
+        {
+          "id": "hf-mirror",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 436182.8683891739,
+          "seconds": 5.877814379986376,
+          "bytes": 1308678,
+          "speed_measured": true,
+          "startup_seconds": 2.876621870091185,
+          "ttfb_seconds": 2.876621870091185,
+          "transfer_seconds": 3.0002943600993603,
+          "measured_bytes": 1308677,
+          "stop_reason": "time-limit",
+          "score": 420460.1955217541,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": false,
+          "score": 0.0
+        }
+      ],
+      "image-models": [
+        {
+          "id": "modelscope",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 18988525.89726766,
+          "seconds": 2.190348669886589,
+          "bytes": 33554432,
+          "speed_measured": true,
+          "startup_seconds": 0.423258839873597,
+          "ttfb_seconds": 0.423258839873597,
+          "transfer_seconds": 1.767089830012992,
+          "measured_bytes": 33554431,
+          "stop_reason": "byte-limit",
+          "score": 15319219.106324052,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": false,
+          "score": 0.0
+        }
+      ],
+      "github": [
+        {
+          "id": "ghfast",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": 1637921.3810187392,
+          "seconds": 4.731630030088127,
+          "bytes": 4914251,
+          "speed_measured": true,
+          "startup_seconds": 1.7304972698912024,
+          "ttfb_seconds": 1.7304972698912024,
+          "transfer_seconds": 3.000296630198136,
+          "measured_bytes": 4914250,
+          "stop_reason": "time-limit",
+          "score": 1510339.5924458033,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": null,
+          "seconds": 7.390984119847417,
+          "bytes": 207683,
+          "speed_measured": false,
+          "startup_seconds": 4.389622349990532,
+          "ttfb_seconds": 4.389622349990532,
+          "transfer_seconds": 3.000263359863311,
+          "measured_bytes": 207682,
+          "stop_reason": "time-limit",
+          "score": 0.0,
+          "body_stalled": false
+        }
+      ],
+      "git": [
+        {
+          "id": "ghfast",
+          "route": "inherited",
+          "ok": true,
+          "seconds": 2.6562272398732603,
+          "bytes": 46,
+          "score": 0.37647381405806013
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": false,
+          "score": 0.0
+        }
+      ],
+      "cuda": [
+        {
+          "id": "nvidia-cn",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": null,
+          "seconds": 0.20322465989738703,
+          "bytes": 1487960,
+          "speed_measured": false,
+          "startup_seconds": 0.13834563991986215,
+          "ttfb_seconds": 0.13834563991986215,
+          "transfer_seconds": 0.06487901997752488,
+          "measured_bytes": 1487959,
+          "stop_reason": "eof",
+          "score": 0.0,
+          "body_stalled": false
+        },
+        {
+          "id": "official",
+          "route": "inherited",
+          "ok": true,
+          "bytes_per_second": null,
+          "seconds": 1.296628079842776,
+          "bytes": 1487960,
+          "speed_measured": false,
+          "startup_seconds": 1.2326908498071134,
+          "ttfb_seconds": 1.2326908498071134,
+          "transfer_seconds": 0.06393723003566265,
+          "measured_bytes": 1487959,
+          "stop_reason": "eof",
+          "score": 0.0,
+          "body_stalled": false
+        }
+      ],
+      "torch-cu130-2.13.0": [
+        {
+          "id": "nju",
+          "ok": true
+        }
+      ],
+      "torch": [
+        {
+          "id": "huaweicloud",
+          "ok": true
+        }
+      ],
+      "torch-cpu": [
+        {
+          "id": "nju",
+          "ok": true
+        }
+      ]
+    }
+  }
+}

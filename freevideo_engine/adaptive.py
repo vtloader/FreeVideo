@@ -717,11 +717,18 @@ def complete_observation(metrics, canvas, output, artifacts, telemetry):
         # from an earlier request. Neither costs what a whole request costs.
         return None
     ram, gpu = telemetry.get('ram', {}), telemetry.get('gpu', {})
-    counts = (ram.get('ram_observation_samples'), gpu.get('samples'))
-    if (not memory_complete(ram) or any(type(n) is not int or n <= 0 for n in counts)
-            or gpu.get('sampling_errors')):
+    # A device with no whole-device sampler (an Ascend host has no NVML) reports
+    # no GPU observation at all, so such a request is judged on its RAM side and
+    # on its allocator peaks instead.
+    incomplete = not memory_complete(ram)
+    if gpu:
+        counts = (ram.get('ram_observation_samples'), gpu.get('samples'))
+        incomplete = (incomplete or any(type(n) is not int or n <= 0 for n in counts)
+                      or bool(gpu.get('sampling_errors')))
+    if incomplete:
         raise ValueError('Complete request finished but resource observations are incomplete.')
-    if any(type(value) is not int or value <= 0 for value in (memory_peak(ram), gpu.get('gpu_peak_bytes'))):
+    observed_peaks = [memory_peak(ram)] + ([gpu.get('gpu_peak_bytes')] if gpu else [])
+    if any(type(value) is not int or value <= 0 for value in observed_peaks):
         raise ValueError('Resource observations require positive measured RAM and GPU peaks.')
     peaks = [metrics.get(name) for name in ('load_peak_reserved_bytes','torch_peak_reserved_bytes',
                                            'final_stage_peak_reserved_bytes')]
@@ -731,9 +738,13 @@ def complete_observation(metrics, canvas, output, artifacts, telemetry):
         'video_decode_seconds','audio_load_decode_seconds','encode_seconds','decode_save_seconds','work_seconds')}
     if not all(finite_number(t) for t in stages.values()):
         raise ValueError('Incomplete per-stage timings.')
+    # Without a whole-device sampler the allocator's reserved peak is the only
+    # available whole-device measurement, and every consumer needs a positive
+    # device number here.
+    whole_gpu_peak_bytes = gpu['gpu_peak_bytes'] if gpu else max(peaks)
     result = dict(full_request=True, validated=True, completed_steps=total_steps,
                   completed_frames=expected, media_verified=True, metrics_complete=True,
-                  peak_reserved_bytes=max(peaks), whole_gpu_peak_bytes=gpu['gpu_peak_bytes'],
+                  peak_reserved_bytes=max(peaks), whole_gpu_peak_bytes=whole_gpu_peak_bytes,
                   ram_peak_bytes=memory_peak(ram), ram_metric=ram.get('ram_guard_metric', 'unknown'),
                   step_seconds=times, stage_seconds=stages,
                   execution_context={

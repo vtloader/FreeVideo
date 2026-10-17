@@ -218,7 +218,7 @@ def initialize(root, progress=lambda **kw: None):
     with runtime_lock(root/'engine/engine.lock', inherit=False) as descriptor, child_lease(descriptor):
         verify(root, value, progress)
         progress(stage='gpu', detail='Detecting your GPU and testing acceleration', done=0, total=1)
-        from .hardware import detect
+        from .cli import detect_hardware as detect
         hardware = detect()
         machine = configuration(root, value, hardware)
         save(root/'engine/machine.json', machine)

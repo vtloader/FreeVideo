@@ -21,6 +21,7 @@ The prompt is zeros of the encoder's width: row counts are compiled
 dynamically, and the values never reach a kernel's shape. No video is kept,
 and no resource history, compatibility or input cache is written.
 """
+from .torch_device import device_module, device_name
 import argparse
 from contextlib import contextmanager
 import json
@@ -43,8 +44,8 @@ class FirstBlockDone(Exception):
 def first_block(engine):
     """Stop sampling when the second transformer block is entered."""
     def stop(module, arguments):
-        if torch.cuda.is_initialized():
-            torch.cuda.synchronize()
+        if device_module(torch).is_initialized():
+            device_module(torch).synchronize()
         raise FirstBlockDone()
     handle = engine.transformer.transformer_blocks[1].register_forward_pre_hook(stop)
     try:
@@ -62,9 +63,10 @@ def zero_latents(channels, canvas):
     from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
         MINIMAX_H3_AUDIO_CHANNELS, align_num_frames, audio_latent_num_frames, video_latent_num_frames)
     frames = align_num_frames(canvas['frames'], 17, 5)
+    device = device_name(torch)
     video = torch.zeros((1, channels, video_latent_num_frames(frames, 17, 5),
-                         canvas['height'] // 16, canvas['width'] // 16), device='cuda')
-    audio = torch.zeros((MINIMAX_H3_AUDIO_CHANNELS, 32, audio_latent_num_frames(frames)), device='cuda')
+                         canvas['height'] // 16, canvas['width'] // 16), device=device)
+    audio = torch.zeros((MINIMAX_H3_AUDIO_CHANNELS, 32, audio_latent_num_frames(frames)), device=device)
     return video, audio
 
 
@@ -79,7 +81,7 @@ def upscale_once(plan, channels):
     video, _ = zero_latents(channels, plan['first'])
     upscale(video, str(path), plan['upscale_target']['width'], plan['upscale_target']['height'])
     del video
-    torch.cuda.empty_cache()
+    device_module(torch).empty_cache()
     return time.perf_counter() - tick
 
 
@@ -90,7 +92,7 @@ def decode_clip(base, decoder, channels, canvas, path):
     video, audio = zero_latents(channels, dict(canvas, frames=CLIP_FRAMES))
     decode_to_file(video, audio, str(path), base=base, **decoder)
     del video, audio
-    torch.cuda.empty_cache()
+    device_module(torch).empty_cache()
     return time.perf_counter() - tick
 
 
@@ -101,8 +103,8 @@ def first_pass(engine, conditioning, request):
         with first_block(engine):
             engine.sample(conditioning, 0, **request)
     except FirstBlockDone:
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if device_module(torch).is_initialized():
+            device_module(torch).empty_cache()
         return time.perf_counter() - tick
     raise RuntimeError('Sampling finished without entering a second block')
 
@@ -117,7 +119,8 @@ def compile_request(request):
     receipt = dict(success=False, geometry=request['geometry'], passes=[])
     save(request['receipt'], receipt)
     receipt['device_memory'] = device_memory_report(request['gpu_budget_bytes'], request.get('allocator_limit_bytes'),
-                                                    reserve_bytes=request.get('gpu_reserve_bytes', 0))
+                                                    reserve_bytes=request.get('gpu_reserve_bytes', 0),
+                                                    device=request.get('device', 'cuda'))
     allocation = receipt['device_memory'].get('effective_allocator_limit_bytes') or request['gpu_budget_bytes']
     tick = time.perf_counter()
     # A missing sampling table becomes zeros of its shape: it is installed by

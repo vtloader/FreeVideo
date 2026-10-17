@@ -4,6 +4,7 @@ Phase times are exclusive wall times, not GPU kernel timings. Native forward
 includes streamed weight transfers; device placement is timed separately.
 Only phase boundaries are sampled, with no CUDA synchronization or tensor hooks.
 """
+from .torch_device import device_module, device_name
 import os
 import json
 from pathlib import Path
@@ -56,7 +57,7 @@ class EncoderTrace:
         self.finished = False
         self.publish_progress = not request.get('idle_preload', False)
         torch = sys.modules.get('torch')
-        initialized = bool(torch is not None and torch.cuda.is_initialized())
+        initialized = bool(torch is not None and device_module(torch).is_initialized())
         self.data = dict(success=False, load_stages=[],
             runtime=dict(resident_worker=resident, torch_imported_at_start=torch is not None,
                          cuda_initialized_at_start=initialized, native_imported_at_start='comfy.sd' in sys.modules),
@@ -96,7 +97,7 @@ class EncoderTrace:
         row = dict(stage=name, seconds=now-self.started)
         # Early startup must not initialize CUDA merely to measure it.
         torch = sys.modules.get('torch')
-        if torch is not None and torch.cuda.is_initialized():
+        if torch is not None and device_module(torch).is_initialized():
             from .encoder_memory import snapshot
             row['gpu'] = metrics.get('gpu') or snapshot(torch)
         try:

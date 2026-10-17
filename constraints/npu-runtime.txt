@@ -1,0 +1,28 @@
+# Ascend NPU runtime for the Linux aarch64 engine environment.
+#
+# Torch and Torch-NPU are reused from the interpreter the venv was created from
+# (`--system-site-packages`), so they are deliberately absent here: the venv
+# must run on the Torch-NPU build that matches the installed CANN version. The
+# engine asks for the `runtime` extra's requirements without the CUDA Triton
+# (environments.runtime_requirements) because a constraints file can only pin
+# what is already required; that is also the only way to keep `triton==3.7.1`
+# out of an Ascend resolution.
+#
+# triton-ascend installs the Ascend Triton fork as the `triton` package. It is
+# installed from the vendored wheel rather than resolved, because the PyPI
+# releases stop at 3.2.0 with cp39/cp310/cp311 wheels only, and their
+# libtriton.so is a CPython extension that refuses a 3.12 interpreter.
+#   version:  3.2.1 (module reports 3.2.0; upstream pairs it with CANN 9.0.0,
+#             Python 3.9-3.13, and the Ascend 910/910_93xx SoC family)
+#   source:   https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+#   vendored: vendor/wheels/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+#   sha256:   3e7b638ef04c333fd3eeeec35076c6636b708480f01a01d0f5a4c005ccb95521
+#   install:  venv/bin/python -m pip install --no-deps vendor/wheels/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+#
+# pybind11 provides the headers the Ascend backend compiles its launcher with;
+# it is imported by triton/backends/ascend/utils.py, not by the engine.
+pybind11==3.1.0
+# comfy-aimdo owns the VBAR channel the Ascend placement offloads blocks through
+# (backends/npu_vbar.py). The engine falls back to host copies without it, but the
+# measured 61.3 GiB device needs the channel, so an Ascend install asks for it.
+comfy-aimdo==0.5.6

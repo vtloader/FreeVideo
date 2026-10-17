@@ -144,6 +144,15 @@ class Gpu:
             lib.nvmlShutdown()
 
 
+def device_gpu(device=None):
+    """The whole-device reader for this host's driver: NVML, else Ascend's DCMI."""
+    try:
+        return Gpu(device)
+    except Exception:
+        from .npu_monitor import Gpu as npu_gpu
+        return npu_gpu(device)
+
+
 def parents():
     """{pid: parent pid} of every process on the machine."""
     if sys.platform == 'win32':
@@ -208,9 +217,9 @@ class Room:
         self.gpu = gpu
         if self.gpu is None and device:
             try:
-                self.gpu = Gpu(device)
+                self.gpu = device_gpu(device)
             except Exception:
-                self.gpu = None  # Without NVML only memory is checked.
+                self.gpu = None  # Without a driver sampler only memory is checked.
         self.baseline = None
         self.baseline_memory = 0
         self.seen = {}

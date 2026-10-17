@@ -5,6 +5,7 @@ Only generated rows are stepped. The transformer, attention, offloading and
 FP8 kernels are the same Engine modules used by ordinary VDN requests.
 The released VDN checkpoint is not a trained Ref2VA checkpoint.
 """
+from .torch_device import device_module, device_name
 import time
 
 import torch
@@ -111,8 +112,8 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         raise ValueError('Reference audio rows disagree with packed layout')
 
     def synchronize():
-        if torch.device(device).type == 'cuda':
-            torch.cuda.synchronize(device)
+        if torch.device(device).type in ('cuda', 'npu'):
+            device_module(torch).synchronize(device)
         elif torch.device(device).type == 'mps':
             torch.mps.synchronize()
 

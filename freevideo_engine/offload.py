@@ -1,4 +1,5 @@
 """Sequential module offloading with bounded pinned-host and CUDA buffers."""
+from .torch_device import device_module, device_name
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
@@ -88,7 +89,7 @@ def live_pin_capacity(*, headroom_bytes=None, nonlocal_reserve_bytes=None, commi
         if capacity is None and memory.get('total_bytes'):
             # Without a DXGI reading, assume the Windows default of half of RAM.
             try:
-                pinned = torch.cuda.memory.host_memory_stats()['allocated_bytes.current']
+                pinned = device_module(torch).host_memory_stats()['allocated_bytes.current']
             except (RuntimeError, KeyError, AttributeError):
                 pinned = 0
             capacity = max(0, memory['total_bytes'] // 2 - pinned - reserve)
@@ -355,11 +356,13 @@ class LayerOffloader:
     the same checkpoint source and layer order; only in-memory sources are restored.
     """
 
-    def __init__(self, layers, device='cuda', prefetch=True, manage_hooks=True, weight_source=None,
+    def __init__(self, layers, device=None, prefetch=True, manage_hooks=True, weight_source=None,
                  host_prefetch=None):
         if torch.is_grad_enabled():
             raise RuntimeError('LayerOffloader requires gradients disabled')
         self.layers = list(layers)
+        if device is None:
+            device = device_name(torch)
         self.device = torch.device(device)
         self.prefetch = prefetch
         self.weight_source = weight_source
@@ -424,7 +427,7 @@ class LayerOffloader:
             host={} if self.pinned_sources else {dtype: staging(count, dtype) for dtype, count in sizes.items()},
             device={dtype: torch.empty(count, dtype=dtype, device=self.device) for dtype, count in sizes.items()},
         ) for _ in range(2 if prefetch else 1)]
-        self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.copy_stream = device_module(torch).Stream(device=self.device)
         self.executor = ThreadPoolExecutor(max_workers=1) if prefetch else None
         self.pending = {}
         self.transfers = []
@@ -567,7 +570,7 @@ class LayerOffloader:
     def _fill_host(self, index, slot):
         # CPU writes must wait for the previous H2D read of this host plane.
         # They need not wait for GPU computation using the separate device plane.
-        with torch.cuda.device(self.device):
+        with device_module(torch).device(self.device):
             waited = 0.
             if slot.copy_done is not None:
                 tick = time.monotonic()
@@ -694,7 +697,7 @@ class LayerOffloader:
 
     def _stage(self, index):
         slot = self.slots[index % len(self.slots)]
-        with torch.cuda.device(self.device):
+        with device_module(torch).device(self.device):
             if index in self.cached:
                 if self.read_ahead is not None:
                     self.read_ahead.consumed(index)
@@ -750,8 +753,8 @@ class LayerOffloader:
                 self.read_ahead.consumed(index)
             if not staged:
                 host_seconds = time.monotonic() - started
-            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            with torch.cuda.stream(self.copy_stream):
+            begin, end = device_module(torch).Event(enable_timing=True), device_module(torch).Event(enable_timing=True)
+            with device_module(torch).stream(self.copy_stream):
                 destination = slot
                 if index in self.cache_candidates:
                     # Allocate on the copying stream so reused allocator blocks
@@ -760,7 +763,7 @@ class LayerOffloader:
                     try:
                         for dtype, count in counts.items():
                             planes[dtype] = torch.empty(count, dtype=dtype, device=self.device)
-                    except torch.cuda.OutOfMemoryError:
+                    except torch.OutOfMemoryError:
                         planes.clear()
                         self.cache_candidates.discard(index)
                     else:
@@ -794,7 +797,7 @@ class LayerOffloader:
             self.prefetch_wait_seconds += time.monotonic() - wait_started
         else:
             slot, done = self._stage(index)
-        torch.cuda.current_stream(self.device).wait_event(done)
+        device_module(torch).current_stream(self.device).wait_event(done)
         for parameter, _, dtype, offset, count, shape in self.layout[index]:
             parameter.data = slot.device[dtype][offset:offset + count].view(shape)
         if self.prefetch and index + 1 < len(self.layers):
@@ -803,8 +806,8 @@ class LayerOffloader:
 
     def _after(self, index):
         slot = self.cached.get(index, self.slots[index % len(self.slots)])
-        done = torch.cuda.Event()
-        done.record(torch.cuda.current_stream(self.device))
+        done = device_module(torch).Event()
+        done.record(device_module(torch).current_stream(self.device))
         slot.compute_done = done
         for parameter, name, *_ in self.layout[index]:
             parameter.data = self.cpu[index][name]

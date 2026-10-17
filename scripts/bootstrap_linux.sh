@@ -45,9 +45,18 @@ fv_find_python() {
         FREEVIDEO_BOOTSTRAP_PYTHON="$FREEVIDEO_PYTHON"
         return 0
     fi
-    for candidate in "$fv_root/envs/unified/bin/python" "$fv_root/envs/engine/bin/python" \
-        "$FREEVIDEO_BOOTSTRAP_ROOT/python/cpython-$FV_PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12" \
-        python3 python3.12 python; do
+    local -a candidates=("$fv_root/envs/unified/bin/python" "$fv_root/envs/engine/bin/python"
+        "$FREEVIDEO_BOOTSTRAP_ROOT/python/cpython-$FV_PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12")
+    if [[ "$(uname -m)" == x86_64 ]]; then
+        candidates+=(python3 python3.12 python)
+    else
+        # The private Python is an x86_64 build, so a host that is not x86_64 runs the
+        # interpreter it already has. That one has to be the 3.12 the engine requires
+        # rather than the 3.9 the launcher accepts, and it is also where the reused
+        # torch-npu lives, so the versioned name is tried before the bare one.
+        candidates+=(python3.12 python3 python)
+    fi
+    for candidate in "${candidates[@]}"; do
         if fv_python_ok "$candidate"; then
             FREEVIDEO_BOOTSTRAP_PYTHON="$(command -v -- "$candidate")"
             return 0
@@ -85,6 +94,17 @@ Missing OS packages require root/sudo approval. Full setup reviews GPU/RAM/disk 
 and model licenses separately. A working NVIDIA driver 580+ is required for the engine.
 Rerun --help after bootstrap for the full command's options.
 EOF
+}
+
+fv_ascend_present() {
+    # Any of these means the CANN stack is installed, which is the only accelerator
+    # the non-x86_64 path supports. The runtime variable is the surest signal, then
+    # the toolkit's own tool, then the driver's device nodes.
+    [[ -n "${ASCEND_HOME_PATH:-}${ASCEND_TOOLKIT_HOME:-}" ]] && return 0
+    command -v npu-smi >/dev/null 2>&1 && return 0
+    [[ -d /usr/local/Ascend ]] && return 0
+    compgen -G '/dev/davinci*' >/dev/null 2>&1 && return 0
+    return 1
 }
 
 fv_missing_tools() {
@@ -365,7 +385,32 @@ freevideo_bootstrap_linux() {
         elif [[ "$mode" == setup ]]; then fv_help; printf '\n'; fi
         return 0
     fi
-    [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { fv_fail 'Use native Windows launchers on Windows. Linux setup currently supports x86_64.'; return 1; }
+    local fv_machine
+    fv_machine="$(uname -m)"
+    [[ "$(uname -s)" == Linux ]] || { fv_fail 'Use native Windows launchers on Windows.'; return 1; }
+    if [[ "$fv_machine" != x86_64 ]]; then
+        # FV_UV_URL and the python-build-standalone download below are x86_64 builds,
+        # so a host that is not x86_64 brings its own Python 3.12 and uv, and needs
+        # uv on PATH. The only accelerator that path supports is an Ascend NPU, and a
+        # host that already has the CANN stack does not have to be told so; naming a
+        # device still wins over the detection.
+        if [[ "$fv_machine" == aarch64 && -z "${FREEVIDEO_SETUP_DEVICE:-}" ]] && fv_ascend_present; then
+            export FREEVIDEO_SETUP_DEVICE=npu
+            (( fv_readonly )) || printf 'Ascend NPU detected; setup targets it (FREEVIDEO_SETUP_DEVICE=npu).\n'
+        fi
+        [[ "$fv_machine" == aarch64 && "${FREEVIDEO_SETUP_DEVICE:-}" == npu ]] || {
+            if [[ -n "${FREEVIDEO_SETUP_DEVICE:-}" ]]; then
+                fv_fail "Linux setup supports x86_64, or aarch64 on an Ascend NPU. FREEVIDEO_SETUP_DEVICE=$FREEVIDEO_SETUP_DEVICE cannot run on $fv_machine."; return 1
+            fi
+            fv_fail "Linux setup supports x86_64, or aarch64 on an Ascend NPU. This host reports $fv_machine and no Ascend NPU was detected; set FREEVIDEO_SETUP_DEVICE=npu to override."; return 1; }
+        # A read-only plan or status needs neither uv nor a private Python; only an
+        # installation does.
+        if (( ! fv_readonly )); then
+            command -v uv >/dev/null 2>&1 || {
+                fv_fail 'An Ascend installation needs uv on PATH; the private bootstrap downloads an x86_64 build.'; return 1; }
+            export FREEVIDEO_UV="$(command -v uv)"
+        fi
+    fi
     if command -v getconf >/dev/null 2>&1 && ! getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
         fv_fail 'Linux setup needs glibc (for example Ubuntu/Debian); musl/Alpine CUDA wheels are unsupported.'; return 1
     fi
@@ -379,6 +424,10 @@ freevideo_bootstrap_linux() {
         fv_system_deps || return 1
     fi
     if (( found )); then
+        if [[ "$fv_machine" != x86_64 ]]; then
+            fv_fail "No Python $FV_PYTHON_VERSION found and the private bootstrap is x86_64 only. Provide Python 3.12 and uv on PATH for an Ascend installation."
+            return 1
+        fi
         fv_missing_tools curl tar gzip sha256sum flock
         fv_system_deps || return 1
         (( ! fv_readonly )) || fv_note 'Check only: a private Python bootstrap is needed to display the plan. No engine, model or system package installation.'

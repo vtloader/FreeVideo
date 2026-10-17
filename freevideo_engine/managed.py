@@ -117,7 +117,14 @@ def _main(argv=None):
                 or (command == 'doctor' and '--probe' not in tail) or '--help' in tail or '-h' in tail)
     snapshot = json.loads(config.read_text(encoding='utf-8'))
     lock_path = os.environ.get('FREEVIDEO_LOCK_PATH', str(Path(snapshot['root']) / 'engine.lock'))
-    with nullcontext() if readonly else runtime_lock(lock_path) as descriptor:
+    # Generation and encoding are device-scoped: the machine lease is shared and the
+    # request itself takes its accelerator's exclusive lease (generate.py). Holding
+    # the machine lease exclusively here would serialize two requests that target
+    # different accelerators, and taking the device lease here too would collide with
+    # the request that inherits this lease. Testing and optimization measure the
+    # whole machine, so they keep the exclusive lease.
+    shared = command in ('generate', 'encode')
+    with (nullcontext() if readonly else runtime_lock(lock_path, shared=shared)) as descriptor:
         machine = json.loads(config.read_text(encoding='utf-8'))
         if machine != snapshot:
             raise ValueError('Installation changed while starting. Rerun the command.')

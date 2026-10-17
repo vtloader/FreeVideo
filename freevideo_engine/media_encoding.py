@@ -7,6 +7,7 @@ being generated, at most 15 s, as the official MiniMax H3 pipeline and ComfyUI's
 native H3 node truncate references to the generated length. A shortened clip is
 reported, never cut silently.
 """
+from .torch_device import device_module, device_name
 import json
 import math
 from contextlib import nullcontext
@@ -217,16 +218,21 @@ def reference_options(normalized, options, step):
     return {'minimax_ref_items': items} if items else {}
 
 
-def encode_latents(normalized, value, base, canvas, *, resident=None, device='cuda'):
+def encode_latents(normalized, value, base, canvas, *, resident=None, device=None):
     import gc
     import numpy as np
     import torch
     from diffusers.modular_pipelines.minimax_h3.encoders import encode_vae_condition
     from .vae_weights import load_audio_vae, load_video_encoder
     from src.inference.render import PIXEL_MEAN, PIXEL_STD
-    if torch.device(device).type not in ('cuda', 'mps'):
-        raise ValueError('Media encoding requires a CUDA or MPS device')
-    empty_cache = torch.mps.empty_cache if torch.device(device).type == 'mps' else torch.cuda.empty_cache
+    # The VAE loaders below default to this process's accelerator, so an omitted
+    # device must resolve the same way rather than naming CUDA and overriding them.
+    if device is None:
+        device = device_name(torch)
+    kind = torch.device(device).type
+    if kind not in ('cuda', 'mps', 'npu'):
+        raise ValueError('Media encoding requires a CUDA, MPS or NPU device')
+    empty_cache = torch.mps.empty_cache if kind == 'mps' else device_module(torch).empty_cache
     refs = [{key: row[key] for key in ('kind', 'early_steps') if key in row} for row in normalized]
     if any(row.get('pixels') for row in normalized):
         print(json.dumps({'event': 'media_encode_phase', 'phase': 'Encoding image/video references'}), flush=True)
@@ -235,7 +241,7 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
         vae, _ = load_video_encoder(base, before_upload=None if resident is None else
                                     lambda model: resident.input_vae_room(model, canvas), device=device)
         lifetime = nullcontext()
-        if torch.device(device).type == 'mps':
+        if kind == 'mps':
             from .backends.mps_vae_encode import bounded_encoder
             lifetime = bounded_encoder(vae)
         with lifetime as memory:

@@ -130,6 +130,20 @@ class FreeVideoGenerate(io.ComfyNode):
         from .resident_process import OWNER
         from .prompt_vlm.service import stop_prestart_for_generation
         stop_prestart_for_generation(PromptServer.instance)
+        # Ascend has no lazy context the way CUDA does: torch_npu creates one on the
+        # first real device operation, and this node's first one is a free-memory
+        # query -- release() below unloads models before the run starts. Nothing has
+        # touched the device by then, so that query fails with "The context is empty
+        # ... rtMemGetInfoEx ... 107002" and the node dies before the engine runs.
+        # Setting the device and its context here is idempotent and only happens
+        # where an NPU is visible, so it costs nothing on other backends.
+        import torch
+        accelerator = getattr(torch, 'npu', None)
+        if accelerator is not None and accelerator.is_available():
+            import os
+            accelerator.set_device(int(os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '0').split(',')[0] or 0))
+            if hasattr(accelerator, 'init'):
+                accelerator.init()
         try:   # the image option must never keep a video from starting
             from .image_gen.service import stop_prestart_for_generation as stop_image_for_generation
             stop_image_for_generation(PromptServer.instance)

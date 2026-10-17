@@ -56,6 +56,34 @@ def device_lock_path(device, path=None):
 
 
 @contextmanager
+def device_runtime_lock(token, path=None):
+    """The GPU-work lease for one accelerator: the machine lease shared, this one exclusive.
+
+    A request takes this instead of the plain machine lease, so requests pinned to
+    different accelerators run beside each other while requests on the same one
+    still serialize. Setup still excludes every request, because it keeps taking
+    the machine lease exclusively. ``token`` is the accelerator's own identity, so
+    the lease follows the physical device even when each process sees that device
+    as its index 0.
+
+    Yields the machine lease's descriptor, so children keep inheriting the same
+    shared lease they inherit today.
+    """
+    lease = device_lock_path(token, path)
+    with runtime_lock(shared=True) as machine:
+        try:
+            with runtime_lock(lease, inherit=False):
+                yield machine
+        except BlockingIOError as error:
+            holders = lock_holders([lease])
+            raise BlockingIOError(
+                'This accelerator is already running another request (%s).'
+                % (token if token else 'unknown device')
+                + ((' Held by %s.' % holders) if holders else '')
+                + ' Requests run beside each other only on different accelerators.') from error
+
+
+@contextmanager
 def runtime_lock(path=None, *, inherit=True, shared=False):
     path = Path(path or os.environ.get('FREEVIDEO_LOCK_PATH', data_root() / 'engine.lock'))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +115,14 @@ def runtime_lock(path=None, *, inherit=True, shared=False):
             # worker tree. Closing a duplicated child handle must not unlock it.
         else:
             import fcntl
-            fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            # An inherited descriptor shares the parent's open-file description, so
+            # the lease is already held in the parent's mode and the child rides it.
+            # Re-taking it here would have to pick a mode: exclusive refuses every
+            # other request's shared machine lease, and shared would downgrade a
+            # parent that holds it exclusively. Windows already rides the inherited
+            # lease without re-locking.
+            if inherited is None:
+                fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         yield stream.fileno()
     finally:
         # Releasing the lease must not discard completed work. Taking it still

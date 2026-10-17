@@ -11,6 +11,7 @@ latents are kept.
 The record describes the ending as a first block of 39 frames. Only the sound
 clock reads that length: the kept sound ends exactly where the picture ends.
 """
+from .torch_device import device_module, device_name
 import math
 from pathlib import Path
 
@@ -188,7 +189,7 @@ def encode(tail, base, *, device='cuda', before_upload=None, posterior='mode'):
     from .media_encoding import encode_visual
     from .vae_weights import load_audio_vae, load_video_encoder
     empty = torch.mps.empty_cache if torch.device(device).type == 'mps' else (
-        torch.cuda.empty_cache if torch.device(device).type == 'cuda' else lambda: None)
+        device_module(torch).empty_cache if torch.device(device).type in ('cuda', 'npu') else lambda: None)
     result = {}
     vae, _ = load_video_encoder(base, before_upload=None if before_upload is None else
                                 lambda model: before_upload(model, False), device=device)

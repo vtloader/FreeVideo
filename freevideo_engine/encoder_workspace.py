@@ -16,6 +16,7 @@ model (encoder_lowmem) when the whole-sequence forward cannot fit at all. On
 Windows a sampler stops a forward that still outgrows its room so recovery can
 retry with more. What each forward used is kept per machine and input kind.
 """
+from .torch_device import device_module, device_name
 import json
 import math
 from pathlib import Path
@@ -109,7 +110,7 @@ class Workspace:
 
     @classmethod
     def for_encoder(cls, torch, checkpoint):
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = device_module(torch).get_device_properties(device_module(torch).current_device())
         path = Path(checkpoint)
         machine = '|'.join((sys.platform, props.name, str(round(props.total_memory / GiB)), path.name,
                             str(path.stat().st_size)))
@@ -160,16 +161,16 @@ def dedicated_room(torch, reader=None, budget=None):
     free memory at all, so on Windows the DXGI budget bounds it as well.
     `budget` is what this process may hold in total under FreeVideo's plan.
     """
-    free = torch.cuda.mem_get_info()[0]
+    free = device_module(torch).mem_get_info()[0]
     if reader is not None:
         try:
             local = reader.sample()['local']
             free = min(free, max(0, local['budget_bytes'] - local['usage_bytes']))
         except (OSError, KeyError):
             pass
-    room = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    room = free + device_module(torch).memory_reserved() - device_module(torch).memory_allocated()
     if budget is not None:
-        room = min(room, budget - torch.cuda.memory_allocated())
+        room = min(room, budget - device_module(torch).memory_allocated())
     return int(max(0, room))
 
 
@@ -229,9 +230,9 @@ class SpillGuard:
         torch = self.torch
         self.disarm()
         self.spill = None
-        self.base_allocated = torch.cuda.memory_allocated()
-        self.base_reserved = torch.cuda.memory_reserved()
-        torch.cuda.reset_peak_memory_stats()
+        self.base_allocated = device_module(torch).memory_allocated()
+        self.base_reserved = device_module(torch).memory_reserved()
+        device_module(torch).reset_peak_memory_stats()
         self.room = None
         if self.reader is not None:
             try:
@@ -248,7 +249,7 @@ class SpillGuard:
 
     def _watch(self):
         while not self.stop.wait(self.interval):
-            grown = self.torch.cuda.memory_reserved() - self.base_reserved
+            grown = device_module(self.torch).memory_reserved() - self.base_reserved
             if grown - self.room > SPILL_MARGIN:
                 self.spill = (self.used(), grown - self.room)
                 return
@@ -259,7 +260,7 @@ class SpillGuard:
 
     def used(self):
         """Working memory beyond the loaded weights: cached blocks it reused plus new ones."""
-        return max(0, int(self.torch.cuda.max_memory_reserved() - self.base_allocated))
+        return max(0, int(device_module(self.torch).max_memory_reserved() - self.base_allocated))
 
     def disarm(self):
         if self.hook is not None:

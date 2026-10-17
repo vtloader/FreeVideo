@@ -1,4 +1,5 @@
 """Isolated interactive worker; keeps compatible idle models until memory is needed."""
+from .torch_device import device_module, device_name
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import gc
@@ -60,8 +61,8 @@ def main():
                     diagnostics.stage('worker_cuda_setup')
                 # An explicit benchmark cap belongs to its request. A cached
                 # process must not silently carry that cap into a later job.
-                torch.cuda.set_per_process_memory_fraction(1.)
-                torch.cuda.reset_peak_memory_stats()
+                device_module(torch).set_per_process_memory_fraction(1.)
+                device_module(torch).reset_peak_memory_stats()
                 from .processes import worker_signals
                 with worker_signals():
                     if module.endswith('.worker'):
@@ -127,13 +128,13 @@ def main():
                     bank.clear()
                 gc.collect()
                 torch = sys.modules.get('torch')
-                if torch is not None and torch.cuda.is_initialized():
+                if torch is not None and device_module(torch).is_initialized():
                     from .torch_compat import empty_host_cache
                     from .encoder_memory import snapshot as memory_snapshot
                     # Finish any pending transfers before recycling their
                     # pinned host storage for the next request.
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                    device_module(torch).synchronize()
+                    device_module(torch).empty_cache()
                     empty_host_cache(torch)
                     cleanup['after'] = memory_snapshot(torch, windows_memory=True)
                 cleanup['complete'] = True

@@ -1,4 +1,5 @@
 """Request-aware model residency inside the isolated interactive GPU worker."""
+from .torch_device import device_module, device_name
 import gc
 import json
 from pathlib import Path
@@ -32,14 +33,14 @@ def gpu_bytes(model):
         return 0
     storages = {}
     for tensor in list(model.parameters()) + list(model.buffers()):
-        if tensor.device.type == 'cuda':
+        if tensor.device.type in ('cuda', 'npu'):
             try:
                 storage = tensor.untyped_storage()
                 storages[storage.data_ptr()] = storage.nbytes()
             except (NotImplementedError, RuntimeError):
                 # Native quantized tensor wrappers expose their packed tensors.
                 for value in vars(tensor).values():
-                    if isinstance(value, torch.Tensor) and value.device.type == 'cuda':
+                    if isinstance(value, torch.Tensor) and value.device.type in ('cuda', 'npu'):
                         storage = value.untyped_storage()
                         storages[storage.data_ptr()] = storage.nbytes()
     return sum(storages.values())
@@ -187,7 +188,7 @@ class ModelBank:
         if entry is None:
             return
         model = entry['model']
-        before = torch.cuda.memory_allocated()
+        before = device_module(torch).memory_allocated()
         encoder_discarded = False
         if role == 'encoder':
             import comfy.model_management
@@ -198,12 +199,12 @@ class ModelBank:
             model.to('meta')
         del model, entry
         gc.collect()
-        torch.cuda.empty_cache()
+        device_module(torch).empty_cache()
         host_cache_released = empty_host_cache(torch)
         self.decisions.append(dict(action='evict', role=role, reason=reason,
                                    encoder_discarded_without_cpu_copy=encoder_discarded,
                                    host_cache_released=host_cache_released,
-                                   released_gpu_bytes=max(0, before - torch.cuda.memory_allocated())))
+                                   released_gpu_bytes=max(0, before - device_module(torch).memory_allocated())))
 
     def park(self, role, reason, ram_need=2*GiB):
         """Release only an idle engine's GPU weights and keep its host side.
@@ -222,12 +223,12 @@ class ModelBank:
         if not self.ram_fits(ram_need + held):
             return declined('Host memory does not cover the parked weights beside the next stage')
         started = time.perf_counter()
-        before = torch.cuda.memory_allocated()
+        before = device_module(torch).memory_allocated()
         moved = model.park()
         if moved is None:
             return declined('Weights share storage; a per-tensor copy would duplicate it')
-        torch.cuda.empty_cache()
-        released = max(0, before - torch.cuda.memory_allocated())
+        device_module(torch).empty_cache()
+        released = max(0, before - device_module(torch).memory_allocated())
         if released < .9 * moved:
             # Something outside the registered tensors still holds these
             # weights, so parking would keep two copies. The caller releases
@@ -241,13 +242,13 @@ class ModelBank:
         for role in list(self.entries):
             self.drop(role, reason)
         gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if device_module(torch).is_initialized():
+            device_module(torch).empty_cache()
 
     def available(self):
-        free, _ = torch.cuda.mem_get_info()
-        allocated = torch.cuda.memory_allocated()
-        return max(0, min(free + torch.cuda.memory_reserved() - allocated - self.gpu_reserve,
+        free, _ = device_module(torch).mem_get_info()
+        allocated = device_module(torch).memory_allocated()
+        return max(0, min(free + device_module(torch).memory_reserved() - allocated - self.gpu_reserve,
                           self.gpu_budget - allocated))
 
     def ram_fits(self, need=2*GiB):
@@ -284,7 +285,7 @@ class ModelBank:
             return None
         if type(free) is not int or free < 0:
             return None
-        return free + torch.cuda.memory_reserved()
+        return free + device_module(torch).memory_reserved()
 
     def make_room(self, role, peak, *, model=None, ram_need=2*GiB, device=False):
         retained = gpu_bytes(model) if model is not None else 0
@@ -297,7 +298,7 @@ class ModelBank:
         def available():
             room = budgeted()
             if ceiling is not None:
-                room = min(room, max(0, ceiling - torch.cuda.memory_allocated() - reserve))
+                room = min(room, max(0, ceiling - device_module(torch).memory_allocated() - reserve))
             return room
         before = available()
         # Once conditioning is ready the current video cannot use the encoder
@@ -454,9 +455,9 @@ class ModelBank:
                        model=self.entries.get('video_vae', {}).get('model'), ram_need=2*GiB)
 
     def snapshot(self):
-        if not torch.cuda.is_initialized():
+        if not device_module(torch).is_initialized():
             return dict(reclaimable_gpu_bytes=0, reclaimable_ram_bytes=0, gpu_uuid=None, models=[])
-        uuid = str(getattr(torch.cuda.get_device_properties(0), 'uuid', ''))
+        uuid = str(getattr(device_module(torch).get_device_properties(0), 'uuid', ''))
         if uuid and not uuid.startswith(('GPU-', 'MIG-')):
             uuid = 'GPU-' + uuid
         host, committed = {}, {}
@@ -476,7 +477,7 @@ class ModelBank:
             from .gpu_budget import owned_pool_capacity
             gpu_capacity = owned_pool_capacity(torch)
         can_release_host = host_cache_release_supported(torch)
-        return dict(reclaimable_gpu_bytes=torch.cuda.memory_reserved(),
+        return dict(reclaimable_gpu_bytes=device_module(torch).memory_reserved(),
                     reclaimable_ram_bytes=(sum(host.values()) if can_release_host else 0) + parked,
                     reclaimable_commit_bytes=(sum(committed.values()) if can_release_host else 0) + parked,
                     retained_pinned_ram_bytes=sum(host.values()), parked_ram_bytes=parked,

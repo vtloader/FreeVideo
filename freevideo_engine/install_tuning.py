@@ -25,6 +25,19 @@ def required_models(rows, reuse_cache):
     return [r for r in rows if not conversion_source(r)]
 
 
+def cache_precision(path):
+    """The storage a prepared cache declares: 'int8', 'fp8', or the BF16 default.
+
+    The merged BF16 cache predates the quantized formats and carries no precision
+    key at all, so its absence is the BF16 answer rather than an unknown one.
+    """
+    try:
+        value = json.loads((Path(path) / 'manifest.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value.get('precision', 'bf16')
+
+
 def cache_compatible(path, capability=None, *, scale_granularity=None):
     try:
         value = json.loads((Path(path) / 'manifest.json').read_text(encoding='utf-8'))
@@ -38,6 +51,12 @@ def cache_compatible(path, capability=None, *, scale_granularity=None):
         if scale_granularity is not None:
             return (scale_granularity in ('rowwise', 'per_tensor') and value.get('precision') == 'fp8'
                     and bool(value.get('groups')) and value.get('scale_granularity') == scale_granularity)
+        if value.get('precision', 'bf16') == 'bf16':
+            # The merged BF16 cache is the unquantized reference the engine runs
+            # as-is, and it is the only prepared cache a device without an FP8
+            # product can produce. It carries no scale granularity, so it matches
+            # every capability, and the capability is deliberately not read here.
+            return bool(value.get('groups'))
         native_format = 'per_tensor' if capability[0] >= 10 else 'rowwise'
         return (value.get('precision') == 'fp8' and bool(value.get('groups')) and
                 (tuple(capability) < (8, 9) or value.get('scale_granularity') == native_format))

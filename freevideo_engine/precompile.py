@@ -168,7 +168,7 @@ def run(machine, *, environment=None, timeout=TIMEOUT_SECONDS, background=False,
     programs and gives way when they need it (background_room): GiveWay.
     """
     from .adaptive import history_path, local_identity
-    from .hardware import detect
+    from .cli import detect_hardware as detect
     from .resource_history import ResourceHistory
     environment = dict(os.environ if environment is None else environment)
     root = Path(machine['root'])

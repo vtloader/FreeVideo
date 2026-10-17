@@ -12,7 +12,9 @@ import sys
 import time
 import traceback
 
-from .hardware import detect
+# detect_hardware picks the detector by installation; imported under the name the rest
+# of this file already calls.
+from .cli import detect_hardware as detect
 from .geometry import geometry
 from .kernel_capabilities import available_backends
 from .policy import choose
@@ -118,11 +120,14 @@ def sampling(args, profile, report):
     import torch
     from .runtime import Engine
     from .locking import runtime_lock
-    from .monitoring import Monitor
+    from .monitoring import device_monitor
     torch.set_num_threads(8)
     options = copy.deepcopy(profile['engine'])
     options['attention'] = args.backends[0]
-    monitor = Monitor(args.out / 'gpu.csv').start()
+    monitor = device_monitor(args.out / 'gpu.csv')
+    if monitor is None:
+        raise RuntimeError('Comparing backends needs a whole-device sampler; '
+                           'this host has neither NVML nor DCMI.')
     engine = None
     try:
         with runtime_lock():

@@ -19,6 +19,7 @@ from contextlib import nullcontext
 import torch
 
 from .offload import LayerOffloader
+from .torch_device import device_module
 
 
 def compile_blocks(decoder):
@@ -31,6 +32,11 @@ def compile_blocks(decoder):
     one or two 8-bit levels. FREEVIDEO_VAE_COMPILE=0 keeps the eager blocks.
     """
     if os.environ.get('FREEVIDEO_VAE_COMPILE', '1').lower() in ('0', 'off', 'false'):
+        return False
+    if device_module(torch) is not torch.cuda:
+        # Every number above is a CUDA graph measurement. Ascend runs without
+        # compiled inference kernels, and compiling there would be a claim about
+        # a device this decoder has never been timed on, so the eager blocks stay.
         return False
     for block in decoder.transformer_blocks:
         if not getattr(block, 'freevideo_compiled', False):

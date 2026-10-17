@@ -3,6 +3,7 @@
 LoRA deltas follow the upstream CPU FP32 merge order. Source files are read-only;
 the derived per-block cache records its own identity, preparation time and hashes.
 """
+from .torch_device import device_module, device_name
 import hashlib
 import json
 from pathlib import Path
@@ -173,7 +174,7 @@ def prepare(base, checkpoint, cache_root):
               'preparation_seconds': time.monotonic() - started,
               'tensor_count': len(params), 'merged_lora_pairs': sum(map(len, sources.loras.values())),
               'arithmetic': 'BF16 weights with original FP32 modules and original CPU LoRA merge',
-              'cuda_used': torch.cuda.is_initialized(), 'original_weights_modified': False}
+              'cuda_used': device_module(torch).is_initialized(), 'original_weights_modified': False}
     temporary = manifest.with_suffix('.tmp')
     temporary.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
     temporary.replace(manifest)

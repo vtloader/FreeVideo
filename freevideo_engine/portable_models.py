@@ -66,7 +66,7 @@ def main(argv=None):
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--sampling-caches', action='store_true')
     args = parser.parse_args(argv)
-    from .hardware import detect
+    from .cli import detect_hardware as detect
     from .monitoring import save
     from .provision import models
     value = plan(args.root, detect(), args.sampling_caches)

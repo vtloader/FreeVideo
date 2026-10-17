@@ -1,6 +1,7 @@
 """Observed capacity, including live usage and enclosing Linux RAM limits."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
+from .torch_device import device_module, device_name
 import importlib.util
 import platform
 import re
@@ -207,10 +208,10 @@ def _detect_local():
     if not torch.cuda.is_available():
         raise RuntimeError('A CUDA GPU is required for VDN generation; plan --hardware-json can inspect presets offline.')
     index = torch.cuda.current_device()
-    free, total = torch.cuda.mem_get_info(index)
+    free, total = device_module(torch).mem_get_info(index)
     ram = system_memory()
     cap, available = cgroup_capacity(include_reclaimable=True)
-    uuid = str(getattr(torch.cuda.get_device_properties(index), 'uuid', ''))
+    uuid = str(getattr(device_module(torch).get_device_properties(index), 'uuid', ''))
     if uuid and not uuid.startswith(('GPU-', 'MIG-')):
         uuid = 'GPU-' + uuid
     driver = ''
@@ -221,7 +222,7 @@ def _detect_local():
         driver = subprocess_output.output_external(query, stderr=subprocess.DEVNULL, timeout=5).strip().splitlines()[0]
     except (OSError, RuntimeError, subprocess.SubprocessError, IndexError):
         pass
-    return Hardware(torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index),
+    return Hardware(device_module(torch).get_device_name(index), torch.cuda.get_device_capability(index),
                     total, free, ram['total_bytes'], min(ram['available_bytes'], available) if available is not None else ram['available_bytes'],
                     platform.system(), str(torch.__version__), str(torch.version.cuda), cap, uuid, driver)
 

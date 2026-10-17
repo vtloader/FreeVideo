@@ -6,6 +6,7 @@ import time
 
 from .monitoring import save
 from . import compilation_diagnostics as compilation
+from .torch_device import device_module
 
 
 class SamplingMemory:
@@ -110,11 +111,12 @@ class SamplingMemory:
                                 and value >= self.previous_process[key]}
         self.previous_process = current
         try:
-            cuda = self.torch.cuda
-            stats = cuda.memory_stats()
-            row.update(allocated_bytes=cuda.memory_allocated(), reserved_bytes=cuda.memory_reserved(),
-                cumulative_peak_allocated_bytes=cuda.max_memory_allocated(),
-                cumulative_peak_reserved_bytes=cuda.max_memory_reserved(),
+            accelerator = device_module(self.torch)
+            stats = accelerator.memory_stats()
+            row.update(allocated_bytes=accelerator.memory_allocated(),
+                reserved_bytes=accelerator.memory_reserved(),
+                cumulative_peak_allocated_bytes=accelerator.max_memory_allocated(),
+                cumulative_peak_reserved_bytes=accelerator.max_memory_reserved(),
                 inactive_split_bytes=stats.get('inactive_split_bytes.all.current'),
                 allocation_retries=stats.get('num_alloc_retries'), allocator_ooms=stats.get('num_ooms'))
         except Exception as error:
@@ -145,7 +147,7 @@ class SamplingMemory:
     def host_counters(self):
         result = {}
         try:
-            stats = self.torch.cuda.memory.host_memory_stats()
+            stats = device_module(self.torch).memory.host_memory_stats()
             for target, source in (('pinned_allocated_bytes', 'allocated_bytes.current'),
                                    ('pinned_active_bytes', 'active_bytes.current')):
                 if type(stats.get(source)) is int and stats[source] >= 0:

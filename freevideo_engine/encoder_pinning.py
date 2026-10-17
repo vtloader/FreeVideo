@@ -1,4 +1,5 @@
 """Native encoder registration for our immutable read-only checkpoint maps."""
+from .torch_device import device_module, device_name
 from contextlib import contextmanager
 import ctypes
 import sys
@@ -145,7 +146,12 @@ def readonly_pinning(torch, manager):
                 unsupported = True
                 _count(manager, 'SKIPS')
                 return False
-        runtime = torch.cuda.cudart()
+        runtime = getattr(device_module(torch), 'cudart', None)
+        if runtime is None:
+            # Ascend has no cudart: host pinning there goes through the
+            # comfy-aimdo host buffer instead of this CUDA-only path.
+            _count(manager, 'SKIPS')
+            return False
         _count(manager, 'ATTEMPTS')
         try:
             code = int(runtime.cudaHostRegister(pointer, size, flags))

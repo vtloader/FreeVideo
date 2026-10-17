@@ -6,6 +6,7 @@ Copyright (c) 2026 LBH-123-AI. Full notice: licenses/latent-upscaler-MIT.txt.
 FreeVideo changes: independent loader, meta initialization, pinned checkpoint
 validation, normalized-space API and explicit model cleanup.
 """
+from .torch_device import device_module, device_name
 import gc
 import hashlib
 from pathlib import Path
@@ -68,7 +69,7 @@ def upscale(video, checkpoint, width, height, *, memory_saving=False):
         del state
         model = model.eval().requires_grad_(False).to(device=video.device,dtype=torch.float16)
         folded = install_folded_convolutions(model) if video.device.type == 'mps' else 0
-        if video.is_cuda:torch.cuda.synchronize(video.device)
+        if video.device.type in ('cuda', 'npu'):device_module(torch).synchronize(video.device)
         elif video.device.type == 'mps':torch.mps.synchronize()
         loaded = time.perf_counter()-tick
         tick = time.perf_counter()
@@ -78,7 +79,7 @@ def upscale(video, checkpoint, width, height, *, memory_saving=False):
         result = model(normalized,scale=scale,
             target_size=(video.shape[2],target_h,target_w),enable_chunking=False)
         result = (result * std + mean).float()
-        if video.is_cuda:torch.cuda.synchronize(video.device)
+        if video.device.type in ('cuda', 'npu'):device_module(torch).synchronize(video.device)
         elif video.device.type == 'mps':torch.mps.synchronize()
         computed = time.perf_counter()-tick
         if not bool(torch.isfinite(result).all()):
@@ -90,7 +91,7 @@ def upscale(video, checkpoint, width, height, *, memory_saving=False):
     finally:
         del model
         gc.collect()
-        if video.is_cuda:torch.cuda.empty_cache()
+        if video.device.type in ('cuda', 'npu'):device_module(torch).empty_cache()
         elif video.device.type == 'mps':torch.mps.empty_cache()
 
 FOLD_BYTES = 512 * 2**20

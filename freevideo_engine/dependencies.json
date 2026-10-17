@@ -1,7 +1,7 @@
 {
   "vdn": {
-    "url": "https://github.com/OpenVDN/vdn-minimax-h3.git",
-    "commit": "30b6b380c2482f3519469350810c2955d8847fd9",
+    "url": "https://github.com/vtloader/vdn-minimax-h3.git",
+    "commit": "00931e1ef4ea0219d27ed359345a86329f426f1b",
     "diffusers_subdirectory": "diffusers",
     "license": "Apache-2.0"
   },
@@ -22,6 +22,22 @@
     "version": "2.2.0",
     "tested_sm120_wheel_sha256": "a89dc581440ec804408da6f6cdd84172950f79523e7dc2656fdfdc9b72a26170",
     "tested_sm120_wheel_scope": "Historical CUDA 12.9 wheel; setup builds or verifies a local wheel for the selected Torch/CUDA/GPU."
+  },
+  "ascend": {
+    "constraints": "constraints/npu-runtime.txt",
+    "layout": "unified only; the venv is created with --system-site-packages",
+    "torch": "reused from the interpreter the venv is created from, because it must match the installed CANN",
+    "triton_ascend": {
+      "url": "https://gitcode.com/Ascend/triton-ascend/releases/download/v3.2.1/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "version": "3.2.1",
+      "vendored": "vendor/wheels/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "3e7b638ef04c333fd3eeeec35076c6636b708480f01a01d0f5a4c005ccb95521",
+      "install": "pip install --no-deps: the wheel provides the triton package itself, and the CUDA triton is excluded from the runtime requirements instead"
+    },
+    "comfy_aimdo": {
+      "version": "0.5.6",
+      "role": "Owns the VBAR channel the Ascend placement offloads blocks through; the engine falls back to host copies without it."
+    }
   },
   "models": {
     "vdn_repo": "OpenVDN/vdn-minimax-h3",

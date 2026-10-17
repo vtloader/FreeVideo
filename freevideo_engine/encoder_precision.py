@@ -7,6 +7,7 @@ H3 pipeline runs this encoder in BF16, the model's own dtype, and conditions
 the transformer on BF16 hidden states; FreeVideo saves them in BF16 too. BF16
 halves the working memory per token and uses tensor cores.
 """
+from .torch_device import device_module, device_name
 from contextlib import contextmanager
 import types
 
@@ -78,11 +79,11 @@ def compact_vision_outputs(wrapper):
 
     def preprocess_embed(self, embed, device):
         merged, extra = original(embed, device)
-        if merged is None or not merged.is_cuda:
+        if merged is None or merged.device.type not in ('cuda', 'npu'):
             return merged, extra
         if extra and extra.get('deepstack') is not None:
             extra = dict(extra, deepstack=[value.to(torch.bfloat16) for value in extra['deepstack']])
-        torch.cuda.empty_cache()
+        device_module(torch).empty_cache()
         return merged, extra
     return types.MethodType(preprocess_embed, wrapper)
 

@@ -1236,6 +1236,14 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
                '--width', str(width), '--height', str(height), '--seconds', str(seconds), '--seed', str(seed),
                '--two-pass' if two_pass else '--no-two-pass',
                '--base-steps', str(base_steps), '--refine-steps', str(refine_steps)]
+    # The child cannot know this installation's accelerator otherwise: --device
+    # defaults to cuda, so an Ascend host took the CUDA detector and failed with
+    # "A CUDA GPU is required for VDN generation". image_gen/service.py passes it the
+    # same way. It rides in the recorded command, so upscales and continuations that
+    # reuse that command keep it.
+    backend = machine.get('device_backend', 'cuda')
+    if backend in ('cuda', 'npu'):
+        command += ['--device', backend]
     if frames is not None:
         position = command.index('--seconds')
         command[position:position + 2] = ['--frames', str(frames)]

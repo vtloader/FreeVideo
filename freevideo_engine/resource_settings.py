@@ -9,6 +9,10 @@ from .monitoring import save
 def setting(backend):
     if backend == 'mps':
         return 'ram_reserve_gib', 1., 'Reserved unified RAM'
+    if backend == 'npu':
+        # Ascend memory is dedicated like VRAM, so the same CLI override and the
+        # same minimum apply; only the reported label names the device.
+        return 'gpu_reserve_gib', .2, 'Reserved NPU memory'
     if backend != 'cuda':
         raise ValueError('Unknown resource backend')
     return 'gpu_reserve_gib', .2, 'Reserved VRAM'

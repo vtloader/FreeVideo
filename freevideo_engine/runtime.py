@@ -1,4 +1,5 @@
 """VDN T2VA/FL2VA engine with file-backed weights and bounded layer offloading."""
+from .torch_device import device_module, device_name
 import gc
 import hashlib
 import json
@@ -71,8 +72,8 @@ class Engine:
         # directories of tables it compiled with zeros (adaln.TableCache).
         self.fetch_tables = fetch_tables
         self.table_placeholders = set()
-        if self.device_backend.capabilities.name != 'cuda':
-            raise NotImplementedError('Engine model execution currently requires the CUDA backend')
+        if self.device_backend.capabilities.name not in ('cuda', 'npu'):
+            raise NotImplementedError('Engine model execution requires the CUDA or NPU backend')
         from .media_request import TASKS
         if task not in TASKS:
             raise ValueError('Unsupported Engine task: ' + str(task))
@@ -95,7 +96,7 @@ class Engine:
             self.weight_cache_headroom_bytes += residual_host_headroom(self.canvas)
         base = base_path() if base is None else Path(base)
         checkpoint = checkpoint_path() if checkpoint is None else Path(checkpoint)
-        if linear_compute not in ('native-fp8', 'bf16-weight-only', 'int8'):
+        if linear_compute not in ('native-fp8', 'bf16-weight-only', 'int8', 'bf16'):
             raise ValueError('Unknown linear compute policy')
         if min(query_chunk, ff_chunk, head_chunk, projection_chunk) < 0:
             raise ValueError('Chunk sizes cannot be negative; zero disables chunking')
@@ -281,7 +282,8 @@ class Engine:
         self.schedule_hook = None
         embeddings = None
         if adaln_cache:
-            self.cursor = ScheduleCursor(schedule_timesteps(steps, task=self.adaln_task))
+            self.cursor = ScheduleCursor(schedule_timesteps(steps, task=self.adaln_task,
+                                                            device=self.device_backend.device))
         table_cache = (TableCache(self.cache, manifest['source_id'], steps, task=self.adaln_task, manifest=manifest,
                                  timesteps=self.cursor.timesteps, channels=model.config.hidden_size, device='cpu',
                                  fetch=fetch_tables)
@@ -316,7 +318,8 @@ class Engine:
                          _load_safetensors(self.cache / f'adaln/{index:02d}.safetensors').items()}
             if adaln_cache and not cache_hit:
                 if embeddings is None:
-                    _, embeddings = schedule_embeddings(model, steps, task=self.adaln_task)
+                    _, embeddings = schedule_embeddings(model, steps, task=self.adaln_task,
+                                                        device=self.device_backend.device)
                 block.load_state_dict({name: value.to(self.device_backend.device) for name, value in adaln.items()}, strict=False, assign=True)
                 table = [block.adaln_proj(embedding) for embedding in embeddings]
                 block.adaln_proj = CachedModulation(table, self.cursor)
@@ -530,7 +533,7 @@ class Engine:
         from .system import windows
         if self.gpu_allocation_bytes is None or not windows():
             return 0
-        return max(0, self.gpu_allocation_bytes - torch.cuda.memory_reserved())
+        return max(0, self.gpu_allocation_bytes - device_module(torch).memory_reserved())
 
     @torch.no_grad()
     def sample(self, *args, compute_options=None, **kwargs):
@@ -826,9 +829,28 @@ class Engine:
                     self.transformer, continuation, seed, self.device_backend.device,
                     **({'video_offset': continuation_offset} if continuation_offset else {})) as prefix, \
                     (watch.layers(self.transformer.transformer_blocks) if watch is not None else nullcontext()):
+                # A request split across accelerators enters and leaves the sampling loop
+                # together. The single-accelerator path -- every request today -- passes
+                # no runtime at all, exactly as it did before any of this existed. The
+                # refine sampler of a two-pass request takes no runtime yet, so a split
+                # request over that route fails on the missing argument rather than
+                # quietly sampling unshared; the hooks there are the next piece of work.
+                from .distributed import parallel_runtime
+                split = parallel_runtime()
+                if split is not None and getattr(self.transformer, '_ulysses_runtime', None) is not split:
+                    # Sequence-parallel sampling: each rank owns its share of the packed
+                    # rows and of the attention heads, and the runtime's collectives carry
+                    # the exchange. install_ulysses patches the block and model forwards,
+                    # so it runs once per model, after every weight has been placed. It
+                    # refuses the model unless all blocks share a head count divisible by
+                    # the world size and the linear head width matches the attention one.
+                    from src.inference.utils.ulysses import install_ulysses
+                    install_ulysses(self.transformer, split)
                 latents, audio = generate_latents(self.transformer, prompt, tags, frames,
                                                 self.steps, seed, self.device_backend.device, step_seconds=step_seconds,
-                                                conditions=conditions, **sampling_kwargs)
+                                                conditions=conditions,
+                                                **({'runtime': split} if split is not None else {}),
+                                                **sampling_kwargs)
                 if prefix is not None:
                     latents, audio = prefix.finish(latents, audio)
                 stats = offloader.stats()

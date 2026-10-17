@@ -173,7 +173,11 @@ def _prepare(root, comfy, machine, run, download, repair=False):
     except (OSError, ValueError):
         saved = None
     recorded = saved == identity
-    uv = root / 'tools' / ('uv.exe' if os.name == 'nt' else 'uv' if sys.platform == 'darwin' else 'uv-x86_64-unknown-linux-gnu/uv')
+    # The pinned tools path is an x86_64 build, so an Ascend host supplies its own uv
+    # through FREEVIDEO_UV, exactly as the engine installer's tools step does.
+    supplied_uv = os.environ.get('FREEVIDEO_UV')
+    uv = (Path(supplied_uv) if supplied_uv else
+          root / 'tools' / ('uv.exe' if os.name == 'nt' else 'uv' if sys.platform == 'darwin' else 'uv-x86_64-unknown-linux-gnu/uv'))
     if not repair and not recorded and isinstance(saved, dict) and dict(saved, nodes=identity['nodes']) == identity:
         # An update gave our own nodes a package. Add only that: everything this ComfyUI
         # already runs on stays as it is, so a failure here leaves a working environment.
@@ -197,6 +201,11 @@ def _prepare(root, comfy, machine, run, download, repair=False):
             create = [uv, 'venv', '--python', machine['python'], env_root]
             if repair:
                 create.insert(2, '--allow-existing')
+            from .environments import setup_device
+            if setup_device() == 'npu':
+                # Torch-NPU lives in the interpreter the engine install already
+                # validated, and there is no CUDA wheel set for Ascend to put here.
+                create.append('--system-site-packages')
             execute(create, env, 'Create ComfyUI Python environment')
         # Match the already validated CUDA packages. Hardlinked uv cache
         # entries share their disk bytes without sharing a writable env.
@@ -223,9 +232,19 @@ def _prepare(root, comfy, machine, run, download, repair=False):
                 reported.update(outside)
             return sorted(found - outside)
         broken = broken_packages()
-        gpu = [name for name in broken if normalize_name(name) in
-               ('torch', 'torchvision', 'torchaudio', 'triton', 'triton-windows')
-               or normalize_name(name).startswith('nvidia-')]
+        from .environments import setup_device
+        def in_torch_family(name):
+            normalized = normalize_name(name)
+            return (normalized in ('torch', 'torchvision', 'torchaudio', 'triton', 'triton-windows')
+                    or normalized.startswith('nvidia-'))
+        if setup_device() == 'npu':
+            # This environment reuses the interpreter's Torch-NPU through
+            # --system-site-packages. The check above reads installed metadata, which
+            # does not see a reused package, so the family looks missing when it is
+            # importable; and the CUDA stack torch's metadata pulls in behind it has no
+            # buyer on an Ascend host. Nothing of the family is installed here.
+            broken = [name for name in broken if not in_torch_family(name)]
+        gpu = [name for name in broken if in_torch_family(name)]
         packages = [name for name in broken if name not in gpu]
         ui.phase('Prepare ComfyUI GPU packages', stage_offset + 1, stage_total)
         def package_install(family, command, label):

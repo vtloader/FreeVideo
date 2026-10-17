@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from ..torch_device import device_module
 from . import image_policy
 from .image_stream import StreamedStack
 
@@ -59,8 +60,8 @@ class _Placement:
     def _trim():
         # Stage peaks are planned on allocated bytes; give the cached blocks back so the
         # next stage's workspace is not fragmented by the previous one's.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if device_module(torch).is_available():
+            device_module(torch).empty_cache()
 
 
 class ImageRunner:
@@ -149,8 +150,8 @@ class ImageRunner:
     def budget(self):
         if self.gpu_budget_bytes is not None:
             return int(self.gpu_budget_bytes)
-        free, _ = torch.cuda.mem_get_info(self.device)
-        return int(free + torch.cuda.memory_reserved(self.device))
+        free, _ = device_module(torch).mem_get_info(self.device)
+        return int(free + device_module(torch).memory_reserved(self.device))
 
     def plan(self, width, height, reference_images=None):
         width, height = width // 32 * 32, height // 32 * 32

@@ -9,4 +9,7 @@ def get_backend(name='cuda', *, torch_module=None):
     if name == 'mps':
         from .mps import MPSBackend
         return MPSBackend(torch_module=torch_module)
+    if name == 'npu':
+        from .npu import NPUBackend
+        return NPUBackend(torch_module=torch_module)
     raise ValueError('Unknown device backend: ' + str(name))

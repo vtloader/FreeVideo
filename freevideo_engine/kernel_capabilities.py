@@ -96,12 +96,36 @@ def matching_receipt(hardware, discovered=None):
     return receipt
 
 
-def available_backends(hardware, *, discovered=None, probe_missing=True):
+def npu_receipt_readiness(hardware):
+    """The saved Ascend kernel checks when they still match this device and code, else None.
+
+    An Ascend device reports no compute capability, so admission cannot be
+    settled from the device's own claims. The probe receipt is what tells a
+    caller those kernels really ran on this device and this code.
+    """
+    from .doctor import npu_package_versions
+    versions = dict(package_versions(), **npu_package_versions())
+    expected = json.loads(json.dumps(identity(hardware, versions)))
+    try:
+        receipt = json.loads(receipt_path().read_text(encoding='utf-8'))
+        if receipt.get('identity') != expected:
+            return None
+        return readiness(receipt['kernel_probes'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def available_backends(hardware, *, discovered=None, probe_missing=True, device='cuda'):
     """Reuse matching checks; re-probe after a GPU, driver or package/code change.
 
     Read-only planning may opt out of probing. Execution callers never turn an
     unavailable requested backend into another backend or a math SDPA kernel.
     """
+    if device == 'npu':
+        # Ascend attention runs through Torch-NPU's operator, not the CUDA
+        # probes, so the device backend owns the candidate set here.
+        from .backends import get_backend
+        return set(get_backend('npu').capabilities.attention_candidates)
     discovered = set(installed_backends() if discovered is None else discovered)
     receipt = matching_receipt(hardware, discovered)
     if receipt is not None and probe_missing and needs_path_recheck(receipt):

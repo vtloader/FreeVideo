@@ -4,6 +4,7 @@ Quantization calls the upstream Fp8Linear constructor on one CUDA matrix at a
 time. Loading binds those exact bytes to the original Fp8Linear class. The BF16
 backup is omitted, as in the separately verified compact-storage wrapper.
 """
+from .torch_device import device_module, device_name
 import argparse
 from contextlib import closing
 import gc
@@ -173,7 +174,7 @@ def prepare_streamed(base, checkpoint, cache_root):
         pending.replace(progress)
         records.append(row)
         linears.update(local_linears)
-        torch.cuda.empty_cache()
+        device_module(torch).empty_cache()
         print(json.dumps({'event': 'prepared_fp8_group', 'preparation': 'streamed', 'group': group,
                           'index': index, 'total': len(group_names), 'reused': False,
                           'bytes': row['bytes'], 'linears': len(local_linears),
@@ -370,7 +371,7 @@ def prepare(source, cache_root, *, base, checkpoint):
         linears.update(local_linears)
         del values, converted
         gc.collect()
-        torch.cuda.empty_cache()
+        device_module(torch).empty_cache()
         print(json.dumps({'event': 'prepared_fp8_group', 'group': group['group'],
                           'bytes': saved['bytes'], 'linears': len(local_linears),
                           'seconds': time.perf_counter() - started}), flush=True)

@@ -7,6 +7,7 @@ conditioning clocks; only generated video rows receive scheduler updates.
 This is an explicit quality-changing refinement, not an exact acceleration of
 single-pass generation. The automatic two-pass route uses this loop for its tail.
 """
+from .torch_device import device_module, device_name
 import time
 
 import torch
@@ -137,8 +138,8 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         video_rows[condition_rows:] = video_scheduler.step(
             prediction[0, condition_rows:].float(), video_t, video_rows[condition_rows:], return_dict=False)[0]
         if step_seconds is not None:
-            if str(device).startswith('cuda'):
-                torch.cuda.synchronize(device)
+            if torch.device(device).type in ('cuda', 'npu'):
+                device_module(torch).synchronize(device)
             elif torch.device(device).type == 'mps':
                 torch.mps.synchronize()
             step_seconds.append(time.perf_counter() - tick)
