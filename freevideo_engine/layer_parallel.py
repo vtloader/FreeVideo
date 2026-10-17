@@ -51,30 +51,18 @@ def _send(tensor, dst):
     _dist().send(tensor.contiguous(), dst=dst)
 
 
-def _recv_like(src, like):
-    """Receive a tensor whose shape the peer announces first.
+def _recv(shape, device, src):
+    """Receive one tensor whose shape both ranks can compute locally.
 
-    The receiver has not run the blocks that produce it, so it cannot infer the shape
-    from anything local; one small message carries it. ``like`` is a tensor or a device:
-    the buffers must already be where the collectives run, and on the rank that receives
-    the activation there is no local tensor of that shape to copy the placement from.
+    No shape is sent: an exchanged header would be a data-dependent tensor built inside
+    the compiled sampling loop, where its dimensions are symbolic and building it from
+    them raises. Every shape here is derivable from parameters and index tensors that
+    both ranks already hold, so the receiver allocates it itself.
     """
-    where = getattr(like, 'device', like)
-    header = torch.empty(3, dtype=torch.int64, device=where)
-    _dist().recv(header, src=src)
-    rows, width, dtype_code = (int(value) for value in header.tolist())
-    dtype = torch.bfloat16 if dtype_code == 0 else torch.float16
-    buffer = torch.empty((1, rows, width), dtype=dtype, device=where)
+    buffer = torch.empty(tuple(int(dimension) for dimension in shape),
+                         dtype=torch.bfloat16, device=device)
     _dist().recv(buffer, src=src)
     return buffer
-
-
-def _send_like(tensor, dst):
-    header = torch.tensor([tensor.shape[1], tensor.shape[2],
-                           0 if tensor.dtype == torch.bfloat16 else 1],
-                          dtype=torch.int64, device=tensor.device)
-    _send(header, dst)
-    _send(tensor, dst)
 
 
 def _forward(self, hidden_states, audio_hidden_states, encoder_hidden_states, timestep,
@@ -116,7 +104,8 @@ def _forward(self, hidden_states, audio_hidden_states, encoder_hidden_states, ti
         packed = packed.index_copy(1, video_indices, video_embeds.to(text_embeds.dtype))
         packed = packed.index_copy(1, audio_indices, audio_embeds.to(text_embeds.dtype))
     else:
-        packed = _recv_like(rank - 1, embed_device)
+        packed = _recv((1, int(position_ids.shape[0]), int(self.proj_in.weight.shape[0])),
+                       embed_device, rank - 1)
 
     for index in range(first, last):
         block = self.transformer_blocks[index]
@@ -129,17 +118,23 @@ def _forward(self, hidden_states, audio_hidden_states, encoder_hidden_states, ti
         packed = block(packed, temb, adaln_indices, rotary_emb)
 
     if last < len(self.transformer_blocks):
-        # Hand the activation to the next stage and wait for the finished result.
-        _send_like(packed, rank + 1)
-        video_output = _recv_like(rank + 1, packed)
-        audio_output = _recv_like(rank + 1, packed)
+        # Hand the activation to the next stage and wait for the finished result. The
+        # output shapes are derivable here: the head width comes from the same weights,
+        # and the row counts from the index tensors every rank holds.
+        _send(packed, rank + 1)
+        video_output = _recv(
+            (1, int(video_indices.numel()), int(self.proj_out.weight.shape[0])),
+            packed.device, rank + 1)
+        audio_output = _recv(
+            (1, int(audio_indices.numel()), int(self.audio_proj_out.weight.shape[0])),
+            packed.device, rank + 1)
     else:
         packed = self.norm_out(packed, temb, timestep_indices.to(embed_device)).to(
             get_parameter_dtype(self.proj_out))
         video_output = self.proj_out(packed).index_select(1, video_indices)
         audio_output = self.audio_proj_out(packed).index_select(1, audio_indices)
-        _send_like(video_output, rank - 1)
-        _send_like(audio_output, rank - 1)
+        _send(video_output, rank - 1)
+        _send(audio_output, rank - 1)
 
     if not return_dict:
         return video_output, audio_output
