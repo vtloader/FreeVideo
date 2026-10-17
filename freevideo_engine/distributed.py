@@ -6,6 +6,8 @@ what changes that -- it pins a rank's accelerator and joins the group before any
 model is built -- and the helpers below are how the rest of the engine asks.
 """
 
+import os
+
 
 def rank_world():
     """``(rank, world_size)`` for this process; ``(0, 1)`` when not distributed.
@@ -30,6 +32,20 @@ def is_main():
     rest stay for the collectives and then stop.
     """
     return rank_world()[0] == 0
+
+
+def layer_split():
+    """``(rank, first, last)`` for this process when the block stack is split, else None.
+
+    Off unless the request's environment asks for it: this changes which weights a rank
+    materializes, and a mis-set split would leave a rank running blocks it never loaded.
+    """
+    if os.environ.get('FREEVIDEO_LAYER_SPLIT', '') not in ('1', 'true', 'yes'):
+        return None
+    rank, world = rank_world()
+    if world <= 1:
+        return None
+    return rank, world
 
 
 _RUNTIME = None

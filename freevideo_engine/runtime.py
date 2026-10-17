@@ -179,6 +179,15 @@ class Engine:
             residual_host_headroom(self.canvas) if residual_offload else 0)
         if resident_blocks > len(model.transformer_blocks):
             raise ValueError('More resident blocks requested than the model contains')
+        from .distributed import layer_split
+        layer = layer_split()
+        if layer is not None:
+            # The layer split decides WHICH blocks this rank has, not how many of them
+            # fit: every block it loads is device-resident, so none is a streaming
+            # candidate. Without this the blocks past the capacity plan's resident count
+            # were bound as host placeholders, and the forward then fed a device kernel a
+            # host tensor.
+            resident_blocks = len(model.transformer_blocks)
         # Build the streamed source before binding transformer blocks.  The
         # previous order loaded every non-resident block into CPU tensors and
         # only converted them to zero-storage placeholders when the first
@@ -301,6 +310,16 @@ class Engine:
         block_bind_seconds = 0.
         upload_submit_seconds = 0.
         block_order = list(range(len(model.transformer_blocks)))
+        from .distributed import layer_split
+        layer = layer_split()
+        if layer is not None:
+            # Split across accelerators: materialize this rank's range only. The rest
+            # stay as the skeleton left them -- no storage, no host copy -- which is the
+            # whole point: together the ranges hold what one device cannot.
+            from .layer_parallel import range_for
+            _rank, _world = layer
+            first, last = range_for(_rank, _world, len(model.transformer_blocks))
+            block_order = list(range(first, last))
         if streamed_source is not None and streamed_source.direct_read:
             # Pins and views are granted in the order blocks are prepared, and
             # the blocks RAM cannot keep are read from the drive every step.
@@ -382,8 +401,25 @@ class Engine:
         if adaln_cache:
             del embeddings
             self.schedule_hook = model.register_forward_pre_hook(self.cursor.before, with_kwargs=True)
-        if any(p.is_meta for p in list(model.parameters()) + list(model.buffers())):
-            raise RuntimeError('Some transformer parameters are still on meta')
+        remaining = [p for p in list(model.parameters()) + list(model.buffers()) if p.is_meta]
+        from .distributed import layer_split
+        split = layer_split()
+        if split is not None and remaining:
+            # Only the blocks outside this rank's range may stay on meta: they hold no
+            # weights here on purpose, because the other rank runs them. Everything else
+            # -- the embeddings, the head, this rank's own blocks -- must be real.
+            from .layer_parallel import range_for
+            rank_index, world = split
+            first, last = range_for(rank_index, world, len(model.transformer_blocks))
+            outside = set()
+            for index in list(range(0, first)) + list(range(last, len(model.transformer_blocks))):
+                block = model.transformer_blocks[index]
+                outside.update(id(tensor) for tensor in
+                               list(block.parameters()) + list(block.buffers()))
+            remaining = [p for p in remaining if id(p) not in outside]
+        if remaining:
+            raise RuntimeError('Some transformer parameters are still on meta: %d tensors'
+                               % len(remaining))
         model.eval().requires_grad_(False)
         from src.models.hybrid_transform import set_inference_mode, set_softmax_backend
         # Engine supplies every window call, including the official cuDNN/FA4
@@ -421,6 +457,11 @@ class Engine:
         self.transformer = model
         print(json.dumps({'event': 'model_load_phase', 'phase': 'Preparing offloaded weight storage'}), flush=True)
         self.offload_layers = (list(model.token_refiner.refiner_blocks) if offload_refiner and not cache_refined_text else []) + list(model.transformer_blocks)[resident_blocks:]
+        if layer_split is not None:
+            # A layer split materializes exactly the blocks it runs and never the others,
+            # so there is nothing here to stream: the offloader would only be asked to
+            # manage meta tensors, which it refuses.
+            self.offload_layers = []
         if stream_weights and self.stream_weight_source is None:
             from .streamed_weights import SafetensorLayers
             prefixes = ([f'token_refiner.refiner_blocks.{index}.' for index in range(len(model.token_refiner.refiner_blocks))]
@@ -842,8 +883,19 @@ class Engine:
                 # refine sampler of a two-pass request takes no runtime yet, so a split
                 # request over that route fails on the missing argument rather than
                 # quietly sampling unshared; the hooks there are the next piece of work.
-                from .distributed import parallel_runtime
-                split = parallel_runtime()
+                from .distributed import layer_split, parallel_runtime
+                layer = layer_split()
+                if layer is not None:
+                    # The block stack is split across accelerators: this rank runs its own
+                    # range and the two hand the activation over once, so the arithmetic is
+                    # unchanged and no attention code is involved. Installed once per model,
+                    # after every weight has been placed.
+                    from .layer_parallel import install as install_layer_parallel
+                    if getattr(self.transformer, '_layer_range', None) is None:
+                        first, last = install_layer_parallel(self.transformer, *layer)
+                        print(json.dumps({'event': 'layer_split', 'rank': layer[0],
+                                          'world_size': layer[1], 'blocks': [first, last]}), flush=True)
+                split = None if layer is not None else parallel_runtime()
                 if split is not None and getattr(self.transformer, '_ulysses_runtime', None) is not split:
                     # Sequence-parallel sampling: each rank owns its share of the packed
                     # rows and of the attention heads, and the runtime's collectives carry
