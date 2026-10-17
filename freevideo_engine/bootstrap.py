@@ -1641,6 +1641,32 @@ class Installer:
             print('Ascend wheel patches already applied', flush=True)
         return changed
 
+    def install_npu_aimdo(self, python):
+        """Use a local comfy-aimdo fork checkout, when this machine has one.
+
+        The published wheel ships aimdo.so and aimdo_rocm.so only and its control module
+        has no "npu" entry, so on this device the engine copies weights through host
+        memory instead of paging them. The fork adds aimdo_npu.so and selects it.
+
+        It cannot be installed from its URL: that library is prebuilt and the fork's
+        .gitignore keeps binaries out of the repository, so a git install would carry
+        control.py's "npu" entry without the library behind it -- worse than the wheel,
+        which at least falls back. So this installs a checkout that is on this machine,
+        and does nothing when there is none.
+
+        --no-build-isolation because the build reads setuptools-scm from this very
+        environment; the stated version because the checkout carries no tag while the
+        dependency pins name 0.5.6.
+        """
+        for candidate in (self.root / 'comfy-aimdo', self.root.parent / 'comfy-aimdo'):
+            if (candidate / 'comfy_aimdo' / 'aimdo_npu.so').is_file():
+                return self.command('npu-aimdo', [str(python), '-m', 'pip', 'install',
+                    '--no-build-isolation', '--no-deps', '--force-reinstall', str(candidate)],
+                    env=dict(self.env, SETUPTOOLS_SCM_PRETEND_VERSION='0.5.6'))
+        print('No comfy-aimdo checkout with its NPU library here; keeping the published wheel',
+              flush=True)
+        return None
+
     def component_tasks(self, uv):
         """Dependencies, not serial UI stages, determine when work can start."""
         tasks = {}
@@ -1744,7 +1770,12 @@ class Installer:
                        # Ascend Triton backend imports pybind11 for its launcher headers.
                        # Naming it here is what installs it; pinning it there sets the
                        # version.
-                       'pybind11']
+                       'pybind11',
+                       # npu-aimdo rebuilds comfy-aimdo from a local fork checkout, and
+                       # setuptools-scm is what that build reads its version from. The
+                       # published wheel above stays as the fallback for hosts without
+                       # the checkout.
+                       'setuptools-scm']
         else:
             command = [uv, 'pip', 'install', '--python', python, '-e', str(SOURCE) + '[runtime]',
                        '-c', constraints_file(name, self.system), 'pip', 'ninja', 'packaging', 'wheel', 'setuptools']
@@ -1758,6 +1789,8 @@ class Installer:
             task('npu-companions', lambda executable=python: self.install_npu_companions(executable),
                  ('npu-acceleration',), ('environment:' + name,))
             task('npu-wheel-patches', lambda executable=python: self.patch_npu_wheels(executable),
+                 ('npu-companions',), ('environment:' + name,))
+            task('npu-aimdo', lambda executable=python: self.install_npu_aimdo(executable),
                  ('npu-companions',), ('environment:' + name,))
         # Enqueue downloads as soon as their SDKs exist, before waiting for
         # source setup, encoder checks or acceleration compilation.
