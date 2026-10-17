@@ -588,7 +588,9 @@ def run(args, machine, ui):
     resources = {k: machine.get(k) for k in ('vram_gib', 'ram_gib')}
     resources.update(capacity_flags(row['command']))
     base = choose(hardware, **resources, attention=row['request']['profile']['engine']['attention'],
-                  available_backends=available_backends(hardware, probe_missing=False), canvas=row['geometry']).legacy_profile()
+                  available_backends=available_backends(hardware, probe_missing=False,
+                                                        device=machine.get('device_backend') or 'cuda'),
+                  canvas=row['geometry']).legacy_profile()
     base['engine'].update(base=str(Path(machine['base']).resolve()), checkpoint=str(Path(machine['checkpoint']).resolve()))
     automatic = copy.deepcopy(base)
     if baseline.get('baseline_identity') is not None:

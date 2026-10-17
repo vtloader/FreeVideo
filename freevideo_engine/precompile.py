@@ -115,7 +115,12 @@ def plan_request(machine, shape, history, identity):
     # request's managed command line carries them.
     args = argparse.Namespace(vram_gib=machine.get('vram_gib'), ram_gib=machine.get('ram_gib'), attention='auto',
                               gpu_reserve_gib=None, ram_reserve_gib=None, task=shape['task'],
-                              cache=Path(machine['cache']), prompt_file=None)
+                              cache=Path(machine['cache']), prompt_file=None,
+                              # automatic_profile() reads the device off this namespace and
+                              # falls back to 'cuda' when it is absent, which sent every
+                              # background precompile on an Ascend install into the CUDA
+                              # detector: "A CUDA GPU is required for VDN generation".
+                              device=machine.get('device_backend') or 'cuda')
     for field, value in read_resources(machine['root'], backend=machine.get('device_backend') or 'cuda').items():
         setattr(args, field, value)
     hardware, _, profile = automatic_profile(args, canvas, stage='after-encoding', evidence=[])
@@ -289,7 +294,10 @@ def check_kernels(hardware, machine, environment, room):
     own_temporary_environment(machine['root'])
     environment = temporary_environment(machine['root'], environment)
     if room is None:
-        available_backends(hardware)
+        # Stating the device is what keeps this off the CUDA probe set: without it the
+        # checks enumerate cudnn and torch-flash on an Ascend host and report no usable
+        # attention backend at all.
+        available_backends(hardware, device=machine.get('device_backend') or 'cuda')
         return
     receipt = matching_receipt(hardware)
     if receipt is not None and not needs_path_recheck(receipt, environment):
@@ -304,8 +312,13 @@ def check_kernels(hardware, machine, environment, room):
     # Not a precompile-* folder: those belong to the lease holder's cleanup.
     with tempfile.TemporaryDirectory(prefix='freevideo-kernel-checks-', ignore_cleanup_errors=True) as folder:
         log = Path(folder) / 'kernel-checks.log'
+        # The device has to be stated: without it doctor falls back to whatever it can
+        # infer from this child's environment, and on an Ascend host that meant probing
+        # the CUDA backends (cudnn, torch-flash), reporting no usable attention backend
+        # and failing the whole precompile on kernels that had compiled fine.
         returncode = watch_worker([sys.executable, '-B', '-m', 'freevideo_engine.managed', '--root', str(machine['root']),
-                                   'doctor', '--probe'], environment, None, log, TIMEOUT_SECONDS, room)
+                                   'doctor', '--probe', '--device', machine.get('device_backend') or 'cuda'],
+                                  environment, None, log, TIMEOUT_SECONDS, room)
         if returncode:
             raise RuntimeError('Kernel checks exited with %d: %s' % (
                 returncode, log.read_bytes()[-2000:].decode('utf-8', errors='replace')))

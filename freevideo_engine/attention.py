@@ -32,7 +32,12 @@ class WindowAttention:
             raise ValueError('Window batch must be positive')
         if window_varlen and query_chunk:
             raise ValueError('Packed varlen windows do not support a query-chunk override')
-        self.device_backend = device_backend if device_backend is not None else get_backend()
+        if device_backend is None:
+            # Same reason as Engine: get_backend() defaults to 'cuda', and this class
+            # takes its attention candidates from whatever backend it ends up with.
+            from .cli import installed_device
+            device_backend = get_backend(installed_device())
+        self.device_backend = device_backend
         self.backend = backend
         self.query_chunk = query_chunk
         self.window_batch = window_batch

@@ -64,7 +64,14 @@ class Engine:
                  task='t2va', stream_weights=False, canvas=None, head_parallelism=1,
                  residual_offload=False, device_backend=None, gpu_allocation_bytes=None,
                  fetch_tables=True, adaln_task=None):
-        self.device_backend = device_backend if device_backend is not None else get_backend()
+        if device_backend is None:
+            # get_backend()'s default is the literal 'cuda', so an Engine built without
+            # one on an Ascend installation got the CUDA backend and, with it, the CUDA
+            # attention candidates -- which then rejected this device's own 'npu'. The
+            # precompile worker builds exactly such an Engine. Ask the record instead.
+            from .cli import installed_device
+            device_backend = get_backend(installed_device())
+        self.device_backend = device_backend
         if gpu_allocation_bytes is not None and (type(gpu_allocation_bytes) is not int or gpu_allocation_bytes < 0):
             raise ValueError('GPU allocation limit must be a nonnegative byte count')
         self.gpu_allocation_bytes = gpu_allocation_bytes

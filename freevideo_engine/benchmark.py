@@ -54,7 +54,8 @@ def main(arguments=None):
         parser.error('--save-best-profile already exists')
     args.out.mkdir(parents=True, exist_ok=False)
     hardware = detect()
-    available = available_backends(hardware)
+    from .cli import installed_device
+    available = available_backends(hardware, device=installed_device())
     if args.backends is None:
         candidates = ['cudnn/fa4', 'cudnn/sage2', 'sage2/sage2', 'cudnn/cudnn', 'torch-flash/torch-flash']
         if 'fa2' in available:

@@ -367,7 +367,9 @@ def main(argv=None):
                     'if_lease_held': 'A held installation lease means another FreeVideo '
                                      'process is using the card. Finish or cancel it, then '
                                      'run the placement test again.'}))
-    policy, rows = plan_variants(hardware, canvas, available_backends(hardware))
+    from .cli import installed_device
+    policy, rows = plan_variants(hardware, canvas,
+                                 available_backends(hardware, device=installed_device()))
     if not rows:
         result = dict(schema_version=1, questions=[], hardware=hardware.to_dict(),
                       note='This machine\'s plan has no open placement question; nothing to measure.')
