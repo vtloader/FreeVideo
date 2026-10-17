@@ -51,16 +51,17 @@ def _send(tensor, dst):
     _dist().send(tensor.contiguous(), dst=dst)
 
 
-def _recv(shape, device, src):
+def _recv(shape, device, src, dtype=torch.bfloat16):
     """Receive one tensor whose shape both ranks can compute locally.
 
     No shape is sent: an exchanged header would be a data-dependent tensor built inside
     the compiled sampling loop, where its dimensions are symbolic and building it from
     them raises. Every shape here is derivable from parameters and index tensors that
-    both ranks already hold, so the receiver allocates it itself.
+    both ranks already hold, so the receiver allocates it itself. The head's outputs are
+    float32 (measured), while the block residual stream is bfloat16.
     """
     buffer = torch.empty(tuple(int(dimension) for dimension in shape),
-                         dtype=torch.bfloat16, device=device)
+                         dtype=dtype, device=device)
     _dist().recv(buffer, src=src)
     return buffer
 
@@ -124,15 +125,19 @@ def _forward(self, hidden_states, audio_hidden_states, encoder_hidden_states, ti
         _send(packed, rank + 1)
         video_output = _recv(
             (1, int(video_indices.numel()), int(self.proj_out.weight.shape[0])),
-            packed.device, rank + 1)
+            packed.device, rank + 1, dtype=torch.float32)
         audio_output = _recv(
             (1, int(audio_indices.numel()), int(self.audio_proj_out.weight.shape[0])),
-            packed.device, rank + 1)
+            packed.device, rank + 1, dtype=torch.float32)
     else:
         packed = self.norm_out(packed, temb, timestep_indices.to(embed_device)).to(
             get_parameter_dtype(self.proj_out))
         video_output = self.proj_out(packed).index_select(1, video_indices)
         audio_output = self.audio_proj_out(packed).index_select(1, audio_indices)
+        if _debug:
+            print('  rank %d head: video=%s/%s audio=%s/%s'
+                  % (rank, tuple(video_output.shape), video_output.dtype,
+                     tuple(audio_output.shape), audio_output.dtype), flush=True)
         _send(video_output, rank - 1)
         _send(audio_output, rank - 1)
 
