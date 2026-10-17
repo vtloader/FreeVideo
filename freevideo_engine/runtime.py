@@ -457,7 +457,10 @@ class Engine:
         self.transformer = model
         print(json.dumps({'event': 'model_load_phase', 'phase': 'Preparing offloaded weight storage'}), flush=True)
         self.offload_layers = (list(model.token_refiner.refiner_blocks) if offload_refiner and not cache_refined_text else []) + list(model.transformer_blocks)[resident_blocks:]
-        if layer_split is not None:
+        # `layer_split` is the helper, not its answer: comparing the function with None
+        # is always true, which emptied this list on every request and left each block
+        # past the resident count in host memory while its forward ran on the device.
+        if layer_split() is not None:
             # A layer split materializes exactly the blocks it runs and never the others,
             # so there is nothing here to stream: the offloader would only be asked to
             # manage meta tensors, which it refuses.
